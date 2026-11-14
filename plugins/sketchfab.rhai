@@ -165,7 +165,9 @@ fn panel_event(id, value) {
     else if id == "token_in" { state_set("token_in", value); }
     else if id == "search" { search(); }
     else if id == "save_token" {
-        let t = st("token_in", "").trim();
+        // note: Rhai's trim() trims the string in place and returns nothing
+        let t = st("token_in", "");
+        t.trim();
         if t != "" && secret_set("token", t) { state_set("token_in", ""); state_set("msg", "Token saved."); }
     }
     else if id == "forget_token" { secret_set("token", ""); state_set("msg", "Token forgotten."); }

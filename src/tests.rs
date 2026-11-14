@@ -2281,6 +2281,24 @@ mod plugin_web_api {
     }
 
     #[test]
+    fn sketchfab_token_saves_and_forgets() {
+        let mut host = crate::plugins::PluginHost::new();
+        let idx = host.plugins.iter().position(|p| p.file == "sketchfab.rhai").unwrap();
+        let (map, models) = (crate::map::Map::default(), crate::mesh::ModelCache::default());
+        let ev = |host: &mut crate::plugins::PluginHost, id: &str, v: &str| host.panel_event(idx, &map, &models, 1.0, id, v);
+        let out = ev(&mut host, "token_in", "  test-token-123  ");
+        assert!(out.status.is_none(), "{:?}", out.status);
+        let out = ev(&mut host, "save_token", "");
+        assert!(out.status.is_none(), "saving the token failed: {:?}", out.status);
+        assert_eq!(secret_get("sketchfab.rhai", "token"), "test-token-123", "saved, trimmed and encrypted");
+        let (w, _) = host.panel(idx, &map, &models, 1.0);
+        assert!(w.iter().any(|x| matches!(x, Widget::Row(items) if items.iter().any(|i| matches!(i, Widget::Button { id, .. } if id == "forget_token")))));
+        let out = ev(&mut host, "forget_token", "");
+        assert!(out.status.is_none(), "{:?}", out.status);
+        assert_eq!(secret_get("sketchfab.rhai", "token"), "");
+    }
+
+    #[test]
     #[ignore] // talks to sketchfab.com
     fn sketchfab_search_live() {
         let mut host = crate::plugins::PluginHost::new();
@@ -2346,6 +2364,23 @@ fn pbr_maps_reach_the_material_variant() {
     assert!(xml.contains("<Content name=\"MetalnessMap\"><url>rbxassetid://333</url></Content>"));
     let lua = export_roblox::to_luau(&nodes, "m");
     assert!(lua.contains("mv.RoughnessMap = \"rbxassetid://222\"") && lua.contains("mv.MetalnessMap = \"rbxassetid://333\""));
+}
+
+#[test]
+#[ignore] // talks to GitHub: checks the real published release
+fn updater_reads_the_real_release() {
+    use crate::updater::*;
+    // same version as this build: nothing to offer, but it must parse cleanly
+    assert_eq!(check(DEFAULT_REPO), Ok(None));
+    let body = std::process::Command::new("gh").args(["api", &format!("repos/{DEFAULT_REPO}/releases/latest")]).output().unwrap().stdout;
+    let rel = parse_release(&serde_json::from_slice(&body).unwrap()).expect("release parses");
+    let sha = rel.sha256.clone().expect("SHA-256 found in the notes");
+    println!("LIVE {} {} sha {}", rel.version, rel.zip_url, sha);
+    if let Ok(p) = std::env::var("ANVIL_RELEASE_ZIP") {
+        let zip = std::fs::read(p).unwrap();
+        let exe = verify_and_extract(&zip, &sha).expect("the published zip passes the updater's checks");
+        println!("LIVE exe {} bytes", exe.len());
+    }
 }
 
 mod stair_maker {

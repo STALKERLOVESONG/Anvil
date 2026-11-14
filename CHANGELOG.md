@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+- **Fixed:** saving your Sketchfab API token failed with
+  "Function not found: secret_set". The plugin updates itself the first time 0.2.1
+  starts.
+- Tests now cover saving and forgetting the token, and check that the updater reads real
+  GitHub releases.
+
 ## 0.2.0 — first public version
 
 **Building and editing**
