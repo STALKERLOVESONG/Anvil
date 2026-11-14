@@ -1,0 +1,44 @@
+[package]
+name = "anvil"
+version = "0.2.0"
+edition = "2021"
+description = "Anvil - a Hammer-style level editor written in Rust that exports to Roblox Studio, Unity and Blender"
+license = "MIT"
+repository = "https://github.com/STALKERLOVESONG/Anvil"
+
+[dependencies]
+eframe = "0.31"
+glam = { version = "0.29", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tobj = "4"
+rfd = "0.15"
+rhai = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
+ureq = "2"
+rayon = "1"
+ttf-parser = "0.25"
+earcutr = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+winresource = "0.1"
+
+# The 3D view is a software rasterizer, so keep dev builds reasonably fast.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+
+# Small, fast exe for sharing (build.bat): cargo build --profile dist
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1
+strip = true
+debug = false
+panic = "abort"

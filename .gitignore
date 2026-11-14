@@ -1,0 +1,9 @@
+/target
+/dist
+anvil_settings.json
+anvil_secrets.json
+plugin_secrets.json
+# machine-specific build location (this PC builds onto another drive)
+/.cargo/config.toml
+# reference screenshot of another app, not ours to publish
+/assets/title_reference.png

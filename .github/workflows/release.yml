@@ -1,0 +1,54 @@
+name: Release
+
+# Push a tag like v0.3.0 (matching the version in Cargo.toml) to publish a
+# release. The zip's SHA-256 goes into the release notes and a .sha256 file;
+# Anvil's updater refuses any release without it.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} doesn't match Cargo.toml version $v" }
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build (small, optimized)
+        run: cargo build --profile dist --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          New-Item -ItemType Directory -Force dist/Anvil/plugins | Out-Null
+          Copy-Item target/dist/anvil.exe dist/Anvil/
+          Copy-Item plugins/*.rhai dist/Anvil/plugins/
+          Copy-Item README.md, LICENSE, CHANGELOG.md dist/Anvil/
+          Compress-Archive -Path dist/Anvil -DestinationPath "dist/Anvil-$v.zip"
+          $h = (Get-FileHash "dist/Anvil-$v.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "dist/Anvil-$v.zip.sha256" -Value $h -NoNewline
+          "ZIP=dist/Anvil-$v.zip" >> $env:GITHUB_ENV
+          "SHA=$h" >> $env:GITHUB_ENV
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $name = Split-Path $env:ZIP -Leaf
+          $notes = "Unzip anywhere and run anvil.exe (Windows 10/11). See CHANGELOG.md for what's new.`n`nSHA-256 $name`: $env:SHA"
+          gh release create "${{ github.ref_name }}" "$env:ZIP" "$env:ZIP.sha256" --title "Anvil ${{ github.ref_name }}" --notes $notes
