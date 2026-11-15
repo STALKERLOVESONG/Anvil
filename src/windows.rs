@@ -2,9 +2,9 @@
 
 use crate::app::{file_name, material_combo, shape_combo, vec2_edit, vec3_edit, AnvilApp, Tool};
 use crate::cloud::{self, CloudMsg, Creator, Job};
-use crate::map::{Shape, TextureDef};
+use crate::map::TextureDef;
 use crate::plugins::PluginKind;
-use crate::settings::{default_presets, Preset, Settings};
+use crate::settings::Settings;
 use crate::texture::TexCache;
 use eframe::egui::{self, RichText};
 use std::collections::HashMap;
@@ -692,74 +692,6 @@ pub(crate) fn settings_ui(ui: &mut egui::Ui, s: &mut Settings) -> bool {
         });
     });
     ui.label(RichText::new("Wall, building, door, window, light, spawn and decal options are in the Tool settings box under the tool list (pick the tool to see them).").small().weak());
-    egui::CollapsingHeader::new(format!("Preset library ({})", s.presets.len())).default_open(true).show(ui, |ui| {
-        ui.label(RichText::new("Presets show up in the Library panel. Pick one, then click to drop it or drag to draw it.").small().weak());
-        let mut remove = None;
-        let mut move_up = None;
-        for (i, p) in s.presets.iter_mut().enumerate() {
-            egui::CollapsingHeader::new(format!("{}  ({})", p.name, p.shape.label())).id_salt(("preset", i)).show(ui, |ui| {
-                egui::Grid::new(("preset_grid", i)).num_columns(2).show(ui, |ui| {
-                    ui.label("Name");
-                    ui.text_edit_singleline(&mut p.name);
-                    ui.end_row();
-                    ui.label("Shape");
-                    shape_combo(ui, ("preset_shape", i), &mut p.shape);
-                    ui.end_row();
-                    ui.label("Size");
-                    vec3_edit(ui, &mut p.size, 0.1, Some(0.01));
-                    ui.end_row();
-                    ui.label("Color");
-                    ui.color_edit_button_srgb(&mut p.color);
-                    ui.end_row();
-                    ui.label("Material");
-                    material_combo(ui, ("preset_mat", i), &mut p.material);
-                    ui.end_row();
-                    if p.shape == Shape::Stairs {
-                        ui.label("Steps");
-                        ui.add(egui::DragValue::new(&mut p.steps).range(1..=128));
-                        ui.end_row();
-                    }
-                    ui.label("Transparency");
-                    ui.add(egui::Slider::new(&mut p.transparency, 0.0..=1.0));
-                    ui.end_row();
-                });
-                ui.horizontal(|ui| {
-                    if i > 0 && ui.small_button("Move up").clicked() {
-                        move_up = Some(i);
-                    }
-                    if ui.small_button("Delete").clicked() {
-                        remove = Some(i);
-                    }
-                });
-            });
-        }
-        if let Some(i) = move_up {
-            s.presets.swap(i, i - 1);
-        }
-        if let Some(i) = remove {
-            s.presets.remove(i);
-        }
-        ui.horizontal(|ui| {
-            if ui.button("Add preset").clicked() {
-                s.presets.push(Preset {
-                    name: format!("Preset {}", s.presets.len() + 1),
-                    shape: s.default_shape,
-                    size: s.default_size,
-                    color: s.default_color,
-                    material: s.default_material,
-                    steps: s.default_steps,
-                    transparency: 0.0,
-                });
-            }
-            if ui.button("Restore built-in presets").clicked() {
-                for p in default_presets() {
-                    if !s.presets.iter().any(|q| q.name == p.name) {
-                        s.presets.push(p);
-                    }
-                }
-            }
-        });
-    });
     egui::CollapsingHeader::new(format!("Model library ({})", s.model_library.len())).default_open(true).show(ui, |ui| {
         ui.label(
             RichText::new(

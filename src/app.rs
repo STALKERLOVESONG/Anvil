@@ -33,6 +33,7 @@ pub(crate) enum Tool {
     Polygon,
     Door,
     Window,
+    Trim,
     Prop,
     Decal,
     Light,
@@ -47,7 +48,7 @@ pub(crate) enum Tool {
 }
 
 impl Tool {
-    pub(crate) const BASIC: [Tool; 17] = [
+    pub(crate) const BASIC: [Tool; 18] = [
         Tool::Select,
         Tool::Block,
         Tool::Wall,
@@ -55,6 +56,7 @@ impl Tool {
         Tool::Polygon,
         Tool::Door,
         Tool::Window,
+        Tool::Trim,
         Tool::Prop,
         Tool::Decal,
         Tool::Light,
@@ -76,6 +78,7 @@ impl Tool {
             Tool::Polygon => "Polygon",
             Tool::Door => "Door",
             Tool::Window => "Window",
+            Tool::Trim => "Trim",
             Tool::Prop => "Prop",
             Tool::Decal => "Decal",
             Tool::Light => "Light",
@@ -109,12 +112,13 @@ impl Tool {
     fn hint(self) -> &'static str {
         match self {
             Tool::Select => "Click to select (Shift/Ctrl+click adds), drag to move, drag the white handles to resize. Shift+drag clones.",
-            Tool::Block => "Drag a rectangle in a 2D view to draw a brush. Click (2D or 3D) to drop the active preset.",
-            Tool::Wall => "Drag a line in the Top or 3D view to draw a wall (height/thickness in Settings).",
-            Tool::Layout => "Click corners of a closed loop in the Top or 3D view. Click the first point, double-click or press Enter to build walls (+ floor). Backspace removes a point.",
+            Tool::Block => "Drag a rectangle in a 2D view to draw a brush.",
+            Tool::Wall => "Drag a line in the Top or 3D view to draw a wall. It stays straight (every 45°); hold Ctrl for any angle.",
+            Tool::Layout => "Drag a box in the Top or 3D view for a rectangular building (Alt = square). Or click corners one by one: lines stay straight (every 45°, Ctrl = any angle). Click the first point, double-click or press Enter to build. Backspace removes a point.",
             Tool::Polygon => "Click points of a closed shape, then close it (first point / double-click / Enter) to make an extruded mesh you can edit.",
             Tool::Door => "Click a wall to cut a door opening (a boolean hole). Click a floor to cut a hatch.",
             Tool::Window => "Click a wall to cut a window opening (adds a glass pane if enabled in Settings).",
+            Tool::Trim => "Click a wall in the 3D view to run a trim strip along it at that height. On a building it wraps all the way around (outside or inside, whichever side you click). Ctrl = no height snapping.",
             Tool::Prop => "Click to place the selected library model.",
             Tool::Decal => "Click a wall or floor to stick a decal on it. Pick its image in the Textures window.",
             Tool::Light => "Click to place a point light.",
@@ -2021,47 +2025,6 @@ impl AnvilApp {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.heading("Presets");
-                    if ui.small_button("Edit…").clicked() {
-                        self.show_settings = true;
-                    }
-                });
-                if self.active_preset.is_some() && ui.small_button("Clear active preset").clicked() {
-                    self.active_preset = None;
-                }
-                let mut place: Option<usize> = None;
-                for (i, p) in self.settings.presets.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                        ui.painter().rect_filled(rect, CornerRadius::ZERO, rgb(p.color));
-                        let resp = ui.selectable_label(self.active_preset == Some(i), &p.name).on_hover_text(format!(
-                            "{} {} x {} x {}, {}",
-                            p.shape.label(),
-                            fmt_num(p.size.x),
-                            fmt_num(p.size.y),
-                            fmt_num(p.size.z),
-                            p.material.label()
-                        ));
-                        if resp.clicked() {
-                            self.active_preset = Some(i);
-                            self.brush_shape = p.shape;
-                            self.tool = Tool::Block;
-                        }
-                        if ui.small_button("+").on_hover_text("Drop at the center of the Top view").clicked() {
-                            place = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = place {
-                    self.active_preset = Some(i);
-                    self.tool = Tool::Block;
-                    let g = self.snap_step();
-                    let c = self.views[0].uv_to_world(snap2(self.views[0].center, g), self.work_y);
-                    self.place(c, true);
-                }
-
-                ui.separator();
-                ui.horizontal(|ui| {
                     ui.heading("Models");
                     if ui.small_button("Add…").clicked() {
                         self.add_models();
@@ -2757,9 +2720,11 @@ impl AnvilApp {
                             self.click_select(hit, add);
                         }
                         Tool::Wall => self.status = "Drag in the Top or 3D view to draw a wall".into(),
+                        Tool::Trim => self.status = "Click a wall in the 3D view to add trim".into(),
                         Tool::Layout | Tool::Polygon => {
                             if view.kind == ViewKind::Top {
-                                let w = view.uv_to_world(uv, self.work_y);
+                                let _ = uv;
+                                let w = self.straight_point(view.uv_to_world(raw_uv, self.work_y), mods.command);
                                 let near_first = self.layout_pts.first().is_some_and(|f| (view.world_to_screen(rect, *f) - p).length() < 9.0);
                                 self.layout_click(w, near_first);
                             } else {
@@ -2852,7 +2817,7 @@ impl AnvilApp {
                 Tool::Wall if view.kind == ViewKind::Top => Drag::Wall2D { view: vi, start: view.uv_to_world(snap2(uv, g), self.work_y) },
                 Tool::Block | Tool::Wall => Drag::Create2D { view: vi, start_uv: snap2(uv, g) },
                 Tool::Door | Tool::Window => Drag::Opening { slot: vi + 1 },
-                Tool::Layout | Tool::Polygon if mods.shift && view.kind == ViewKind::Top && self.layout_pts.is_empty() => {
+                Tool::Layout | Tool::Polygon if view.kind == ViewKind::Top && self.layout_pts.is_empty() => {
                     Drag::Outline2D { view: vi, start: view.uv_to_world(snap2(uv, g), self.work_y), square: mods.alt }
                 }
                 Tool::Knife => Drag::Knife { slot: vi + 1, start: if mods.command { start } else { view.uv_to_screen(rect, snap2(uv, g)) } },
@@ -2969,7 +2934,7 @@ impl AnvilApp {
                     }
                 }
                 Drag::Wall2D { view: dv, start } if dv == vi => {
-                    let end = view.uv_to_world(snap2(cur_uv, g), self.work_y);
+                    let end = self.straight_end(start, view.uv_to_world(cur_uv, self.work_y), mods.command);
                     self.create_wall(start, end);
                 }
                 Drag::Opening { slot } if slot == vi + 1 => {
@@ -3004,6 +2969,9 @@ impl AnvilApp {
         painter.rect_filled(rect, CornerRadius::ZERO, rgb(self.settings.bg_2d));
         view.draw_grid(&painter, rect, self.settings.grid);
 
+        // wireframe lines are costly to draw: past this many, detailed props
+        // (not selected ones) show as their outline box
+        let mut budget: usize = 40_000;
         for pass in 0..2 {
             for wm in scene {
                 let sel = self.selection.contains(&wm.id);
@@ -3020,14 +2988,23 @@ impl AnvilApp {
                     continue;
                 }
                 let stroke = Stroke::new(if sel { 1.6f32 } else { 1.0 }, col);
-                if wm.mesh.edges.len() > 300 && r.width().max(r.height()) < 120.0 {
+                let dense = wm.mesh.edges.len() > 300;
+                if dense && (r.width().max(r.height()) < 120.0 || (!sel && wm.mesh.edges.len() > budget)) {
                     // dense prop drawn small: its outline box reads just as well
                     painter.rect_stroke(r, CornerRadius::ZERO, stroke, StrokeKind::Middle);
                     continue;
                 }
+                if dense && !sel {
+                    budget -= wm.mesh.edges.len();
+                }
                 let pts: Vec<Pos2> = wm.pos.iter().map(|p| view.world_to_screen(rect, *p)).collect();
                 for e in &wm.mesh.edges {
-                    painter.line_segment([pts[e[0] as usize], pts[e[1] as usize]], stroke);
+                    let (a, b) = (pts[e[0] as usize], pts[e[1] as usize]);
+                    // skip lines that are off this view or shorter than a pixel
+                    if (a - b).length_sq() < 0.25 || !rect.intersects(Rect::from_two_pos(a, b)) {
+                        continue;
+                    }
+                    painter.line_segment([a, b], stroke);
                 }
             }
         }
@@ -3075,7 +3052,8 @@ impl AnvilApp {
                 painter.line_segment([w[0], w[1]], Stroke::new(2.0f32, preview));
             }
             if let Some(hp) = ui.ctx().pointer_hover_pos().filter(|p| rect.contains(*p)) {
-                let cur = view.uv_to_screen(rect, snap2(view.screen_to_uv(rect, hp), g));
+                let free = ui.input(|i| i.modifiers.command);
+                let cur = view.world_to_screen(rect, self.straight_point(view.uv_to_world(view.screen_to_uv(rect, hp), self.work_y), free));
                 if let Some(last) = pts.last() {
                     painter.line_segment([*last, cur], Stroke::new(1.0f32, preview.gamma_multiply(0.6)));
                 }
@@ -3103,7 +3081,7 @@ impl AnvilApp {
                 painter.text(r.center_top() - vec2(0.0, 6.0), Align2::CENTER_BOTTOM, format!("{} x {}", fmt_num(d.x), fmt_num(d.y)), font.clone(), preview);
             }
             Drag::Wall2D { view: dv, start } if *dv == vi => {
-                let end = view.uv_to_world(snap2(view.screen_to_uv(rect, self.drag_cur), g), self.work_y);
+                let end = self.straight_end(*start, view.uv_to_world(view.screen_to_uv(rect, self.drag_cur), self.work_y), ui.input(|i| i.modifiers.command));
                 let (a, b) = (view.world_to_screen(rect, *start), view.world_to_screen(rect, end));
                 let thick = (self.settings.wall_thickness * view.zoom).max(2.0);
                 painter.line_segment([a, b], Stroke::new(thick, preview.gamma_multiply(0.5)));
@@ -3168,11 +3146,10 @@ impl AnvilApp {
 
         let fov = self.settings.fov;
         let preview = Color32::from_rgb(120, 220, 255);
-        let g = self.snap_step();
         if let Drag::Wall3D { start } = &self.drag {
             let (o, d) = self.cam.ray(rect, fov, self.drag_cur);
             if let Some(p) = ray_plane(o, d, self.work_y) {
-                let end = Vec3::new(snap(p.x, g), self.work_y, snap(p.z, g));
+                let end = self.straight_end(*start, Vec3::new(p.x, self.work_y, p.z), resp.ctx.input(|i| i.modifiers.command));
                 let h = Vec3::Y * self.settings.wall_height;
                 for (a, b) in [(*start, end), (*start + h, end + h), (*start, *start + h), (end, end + h)] {
                     if let Some((sa, sb)) = self.cam.project_segment(rect, fov, a, b) {
@@ -3186,7 +3163,8 @@ impl AnvilApp {
             if let Some(hp) = resp.hover_pos() {
                 let (o, d) = self.cam.ray(rect, fov, hp);
                 if let Some(p) = ray_plane(o, d, self.work_y) {
-                    pts.push(Vec3::new(snap(p.x, g), self.work_y, snap(p.z, g)));
+                    let free = resp.ctx.input(|i| i.modifiers.command);
+                    pts.push(self.straight_point(Vec3::new(p.x, self.work_y, p.z), free));
                 }
             }
             for w in pts.windows(2) {
@@ -3394,7 +3372,7 @@ impl AnvilApp {
                     Tool::Wall => self.status = "Drag on the ground to draw a wall".into(),
                     Tool::Layout | Tool::Polygon => {
                         if let Some(q) = ray_plane(o, d, self.work_y) {
-                            let w = Vec3::new(snap(q.x, g), self.work_y, snap(q.z, g));
+                            let w = self.straight_point(Vec3::new(q.x, self.work_y, q.z), mods.command);
                             let near_first = self
                                 .layout_pts
                                 .first()
@@ -3405,6 +3383,10 @@ impl AnvilApp {
                     }
                     Tool::Door | Tool::Window => match pick_ray(scene, o, d) {
                         Some(h) => self.cut_opening_at(h.id, h.point, (o, d), self.tool == Tool::Window, !mods.command),
+                        None => self.status = "Click on a wall".into(),
+                    },
+                    Tool::Trim => match pick_ray(scene, o, d) {
+                        Some(h) => self.place_trim(h.id, h.point, h.normal, !mods.command),
                         None => self.status = "Click on a wall".into(),
                     },
                     Tool::Decal => {
@@ -3503,7 +3485,7 @@ impl AnvilApp {
                 }
                 Tool::Knife => self.drag = Drag::Knife { slot: 0, start },
                 Tool::Door | Tool::Window => self.drag = Drag::Opening { slot: 0 },
-                Tool::Layout | Tool::Polygon if mods.shift && self.layout_pts.is_empty() => {
+                Tool::Layout | Tool::Polygon if self.layout_pts.is_empty() => {
                     if let Some(p) = ray_plane(o, d, self.work_y) {
                         self.drag = Drag::Outline3D { start: Vec3::new(snap(p.x, g), self.work_y, snap(p.z, g)), square: mods.alt };
                     }
@@ -3549,7 +3531,7 @@ impl AnvilApp {
             if let Drag::Wall3D { start } = drag {
                 let (o, d) = self.cam.ray(rect, fov, self.drag_cur);
                 if let Some(p) = ray_plane(o, d, self.work_y) {
-                    self.create_wall(start, Vec3::new(snap(p.x, g), self.work_y, snap(p.z, g)));
+                    self.create_wall(start, self.straight_end(start, Vec3::new(p.x, self.work_y, p.z), mods.command));
                 }
             } else if let Drag::Outline3D { start, square } = drag {
                 let (o, d) = self.cam.ray(rect, fov, self.drag_cur);

@@ -152,6 +152,54 @@ pub fn house_trim(pts: &[Vec3], wall_t: f32, wall_h: f32, base_y: f32, trim_h: f
     out
 }
 
+/// Floor / ceiling slab for a footprint: a Box for axis-aligned
+/// rectangles (one Roblox part), otherwise an extruded polygon mesh.
+pub fn slab(pts: &[Vec3], base_y: f32, thickness: f32, color: [u8; 3], material: Material) -> Object {
+    let n = pts.len();
+    let rect = n == 4
+        && (0..4).all(|i| {
+            let d = pts[(i + 1) % 4] - pts[i];
+            d.x.abs() < 1e-4 || d.z.abs() < 1e-4
+        });
+    if rect {
+        let mn = pts.iter().fold(Vec3::splat(f32::MAX), |a, p| a.min(*p));
+        let mx = pts.iter().fold(Vec3::splat(f32::MIN), |a, p| a.max(*p));
+        let size = Vec3::new(mx.x - mn.x, thickness, mx.z - mn.z);
+        let pos = Vec3::new((mn.x + mx.x) * 0.5, base_y + thickness * 0.5, (mn.z + mx.z) * 0.5);
+        Object::brush(Shape::Box, size, pos, color, material)
+    } else {
+        let (verts, faces, center) = prism(pts, base_y, thickness);
+        Object::new(Kind::Mesh { verts, faces }, center, color, material)
+    }
+}
+
+/// Everything the Building tool makes for an outline: walls (+ corner
+/// pieces), trim, floor and ceiling.
+pub fn house_objects(pts: &[Vec3], s: &crate::settings::Settings, work_y: f32, wall_tex: Option<u64>, floor_tex: Option<u64>) -> Vec<Object> {
+    let mut out = Vec::new();
+    for mut o in house_walls(pts, s.wall_thickness, s.wall_height, work_y, s.wall_color, s.wall_material) {
+        o.texture = wall_tex;
+        out.push(o);
+    }
+    out.extend(house_trim(pts, s.wall_thickness, s.wall_height, work_y, s.trim_height, s.trim_depth, s.trim_baseboard, s.trim_crown, s.trim_color));
+    // the walls stand centered on the outline, so the floor and ceiling use
+    // the walls' outer edge: flush with their outside faces, no step
+    let outer = inset_outline(pts, -s.wall_thickness * 0.5);
+    let pts = &outer[..];
+    if s.layout_floor {
+        let mut f = slab(pts, work_y - s.floor_thickness, s.floor_thickness, s.floor_color, s.floor_material);
+        f.name = "Floor".into();
+        f.texture = floor_tex;
+        out.push(f);
+    }
+    if s.layout_ceiling {
+        let mut c = slab(pts, work_y + s.wall_height, s.floor_thickness, s.wall_color, s.wall_material);
+        c.name = "Ceiling".into();
+        out.push(c);
+    }
+    out
+}
+
 impl AnvilApp {
     /// A wall brush along a → b on the work plane, extended by `extend` at both ends.
     pub(crate) fn wall_object(&self, a: Vec3, b: Vec3, extend: f32) -> Option<Object> {
@@ -196,56 +244,16 @@ impl AnvilApp {
         }
     }
 
-    /// Floor / ceiling slab for a footprint: a Box for axis-aligned
-    /// rectangles (one Roblox part), otherwise an extruded polygon mesh.
-    fn slab(&self, pts: &[Vec3], base_y: f32, thickness: f32, color: [u8; 3], material: Material) -> Object {
-        let n = pts.len();
-        let rect = n == 4
-            && (0..4).all(|i| {
-                let d = pts[(i + 1) % 4] - pts[i];
-                d.x.abs() < 1e-4 || d.z.abs() < 1e-4
-            });
-        if rect {
-            let mn = pts.iter().fold(Vec3::splat(f32::MAX), |a, p| a.min(*p));
-            let mx = pts.iter().fold(Vec3::splat(f32::MIN), |a, p| a.max(*p));
-            let size = Vec3::new(mx.x - mn.x, thickness, mx.z - mn.z);
-            let pos = Vec3::new((mn.x + mx.x) * 0.5, base_y + thickness * 0.5, (mn.z + mx.z) * 0.5);
-            Object::brush(Shape::Box, size, pos, color, material)
-        } else {
-            let (verts, faces, center) = prism(pts, base_y, thickness);
-            Object::new(Kind::Mesh { verts, faces }, center, color, material)
-        }
-    }
-
     fn build_house(&mut self, pts: &[Vec3]) {
         self.push_undo();
         let n = self.map.folders.iter().filter(|f| f.name.starts_with("Building")).count() + 1;
         let folder = self.map.add_folder(&format!("Building {n}"), None);
-        let s = self.settings.clone();
-        let mut ids = Vec::new();
         let wall_tex = self.build_wall_texture.filter(|t| self.map.textures.iter().any(|d| d.id == *t));
         let floor_tex = self.build_floor_texture.filter(|t| self.map.textures.iter().any(|d| d.id == *t));
-        for mut o in house_walls(pts, s.wall_thickness, s.wall_height, self.work_y, s.wall_color, s.wall_material) {
-            o.folder = Some(folder);
-            o.texture = wall_tex;
-            ids.push(self.map.add(o));
-        }
-        for mut o in house_trim(pts, s.wall_thickness, s.wall_height, self.work_y, s.trim_height, s.trim_depth, s.trim_baseboard, s.trim_crown, s.trim_color) {
+        let mut ids = Vec::new();
+        for mut o in house_objects(pts, &self.settings, self.work_y, wall_tex, floor_tex) {
             o.folder = Some(folder);
             ids.push(self.map.add(o));
-        }
-        if s.layout_floor {
-            let mut f = self.slab(pts, self.work_y - s.floor_thickness, s.floor_thickness, s.floor_color, s.floor_material);
-            f.name = "Floor".into();
-            f.folder = Some(folder);
-            f.texture = floor_tex;
-            ids.push(self.map.add(f));
-        }
-        if s.layout_ceiling {
-            let mut c = self.slab(pts, self.work_y + s.wall_height, s.floor_thickness, s.wall_color, s.wall_material);
-            c.name = "Ceiling".into();
-            c.folder = Some(folder);
-            ids.push(self.map.add(c));
         }
         self.selection = ids;
         self.status = format!("Built 'Building {n}' with {} walls. Use the Door / Window tools to cut openings.", pts.len());
@@ -415,7 +423,7 @@ impl AnvilApp {
             .map
             .objects
             .iter()
-            .filter(|t| t.id != wall.id && t.folder == wall.folder && (t.name.starts_with("Baseboard") || t.name.starts_with("Crown")))
+            .filter(|t| t.id != wall.id && t.folder == wall.folder && (t.name.starts_with("Baseboard") || t.name.starts_with("Crown") || t.name.starts_with("Trim")))
             .map(|t| t.id)
             .collect();
         for tid in trims {

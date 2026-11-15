@@ -18,12 +18,27 @@ impl AnvilApp {
             match self.tool {
                 Tool::Wall | Tool::Layout => ch |= self.building_options(ui),
                 Tool::Door | Tool::Window => ch |= self.opening_options(ui),
+                Tool::Trim => {
+                    let s = &mut self.settings;
+                    egui::Grid::new("tp_trim").num_columns(2).spacing([6.0, 3.0]).show(ui, |ui| {
+                        ui.label("Height");
+                        ch |= ui.add(egui::DragValue::new(&mut s.trim_height).speed(0.05).range(0.05..=50.0)).changed();
+                        ui.end_row();
+                        ui.label("Sticks out");
+                        ch |= ui.add(egui::DragValue::new(&mut s.trim_depth).speed(0.02).range(0.02..=10.0)).changed();
+                        ui.end_row();
+                        ui.label("Color");
+                        ch |= ui.color_edit_button_srgb(&mut s.trim_color).changed();
+                        ui.end_row();
+                    });
+                    ui.label(RichText::new("Click near the bottom of a wall for a baseboard, near the top for a crown, anywhere between for a stripe. Doors and windows cut through it.").small().weak());
+                }
                 Tool::Polygon => {
                     ui.horizontal(|ui| {
                         ui.label("Start height");
                         ch |= ui.add(egui::DragValue::new(&mut self.settings.polygon_height).speed(0.1).range(0.01..=10000.0)).changed();
                     });
-                    ui.label(RichText::new("After closing the outline, move the mouse to set the height. Shift+drag = exact rectangle.").small().weak());
+                    ui.label(RichText::new("Drag for a rectangle, or click points (lines stay straight, Ctrl = any angle). After closing the outline, move the mouse to set the height.").small().weak());
                 }
                 Tool::Light => {
                     egui::Grid::new("tp_light").num_columns(2).show(ui, |ui| {

@@ -3154,3 +3154,235 @@ mod uv_editing {
         assert!(near(uv_at(grab, &p), uv_at(grab + dl, &np)));
     }
 }
+
+/// Renders a building (walls, crown + baseboard trim, floor, ceiling) from
+/// outside a corner and from inside, into test_out/building/.
+#[test]
+fn building_renders_clean() {
+    use crate::view3d::{Camera, RenderOpts, Renderer};
+    let mut s = crate::settings::Settings::default();
+    s.layout_ceiling = true;
+    s.trim_crown = true;
+    s.trim_baseboard = true;
+    let pts = [Vec3::new(0.0, 0.0, 0.0), Vec3::new(20.0, 0.0, 0.0), Vec3::new(20.0, 0.0, 14.0), Vec3::new(0.0, 0.0, 14.0)];
+    let mut map = Map::default();
+    let f = map.add_folder("Building 1", None);
+    for mut o in crate::building::house_objects(&pts, &s, 0.0, None, None) {
+        o.folder = Some(f);
+        map.add(o);
+    }
+    let wall1 = map.objects.iter().find(|o| o.name == "Wall1").unwrap().id;
+    for (at, n, c) in [(Vec3::new(10.0, 7.0, -0.5), Vec3::NEG_Z, [140, 90, 50]), (Vec3::new(10.0, 3.0, 0.5), Vec3::Z, [230, 230, 220])] {
+        for o in crate::trim::trim_plan(&map, wall1, at, n, 0.8, 0.3, 1.0, c).unwrap() {
+            map.add(o);
+        }
+    }
+    let scene = crate::mesh::build_scene(&map, &mut ModelCache::default());
+    let dir = out_dir("building");
+    let ctx = eframe::egui::Context::default();
+    let rect = eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::vec2(800.0, 450.0));
+    for (name, eye, at) in [("outside_top", Vec3::new(26.0, 18.0, -7.0), Vec3::new(20.0, 12.0, 0.0)), ("outside_low", Vec3::new(25.0, -2.0, -6.0), Vec3::new(20.0, 0.0, 0.0)), ("inside", Vec3::new(3.0, 6.0, 11.0), Vec3::new(19.0, 8.0, 1.0))] {
+        let cam = Camera::looking_at(eye, at);
+        let opts = RenderOpts { fov: 70.0, grid: 1.0, plane_y: 0.0, show_grid: false, outlines: false, bg: [58, 66, 80], scale: 1.0, filter: true, lighting: Default::default() };
+        let mut r = Renderer::default();
+        r.render(&ctx, rect, &cam, &opts, &scene, &[], &HashMap::new(), &mut crate::texture::TexCache::default());
+        let (w, h, px) = r.pixels();
+        write_png(&dir.join(format!("{name}.png")), w, h, px);
+    }
+    // the floor and ceiling cover the walls' full footprint, flush with their outer faces
+    let bounds = |name: &str| {
+        let o = map.objects.iter().find(|o| o.name == name).unwrap();
+        let m = crate::mesh::world_mesh(o, &[], &mut ModelCache::default());
+        m.pos.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)))
+    };
+    let (wmn, wmx) = map.objects.iter().filter(|o| o.name.starts_with("Wall")).fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), o| {
+        let m = crate::mesh::world_mesh(o, &[], &mut ModelCache::default());
+        m.pos.iter().fold((a, b), |(a, b), p| (a.min(*p), b.max(*p)))
+    });
+    for slab in ["Floor", "Ceiling"] {
+        let (mn, mx) = bounds(slab);
+        assert!((mn.x - wmn.x).abs() < 1e-3 && (mn.z - wmn.z).abs() < 1e-3 && (mx.x - wmx.x).abs() < 1e-3 && (mx.z - wmx.z).abs() < 1e-3, "{slab} {mn} {mx} vs walls {wmn} {wmx}");
+    }
+}
+
+#[test]
+fn trim_wraps_buildings_and_strips_walls() {
+    let s = crate::settings::Settings::default();
+    // an L-shaped building with a slanted corner
+    let pts = [Vec3::new(0.0, 0.0, 0.0), Vec3::new(20.0, 0.0, 0.0), Vec3::new(20.0, 0.0, 10.0), Vec3::new(14.0, 0.0, 16.0), Vec3::new(0.0, 0.0, 16.0)];
+    let mut map = Map::default();
+    let f = map.add_folder("Building 1", None);
+    for mut o in crate::building::house_objects(&pts, &s, 0.0, None, None) {
+        o.folder = Some(f);
+        map.add(o);
+    }
+    let (outline, t, base, h) = crate::trim::building_outline(&map, Some(f)).expect("outline from the walls");
+    assert_eq!(outline.len(), 5);
+    for (a, b) in outline.iter().zip(pts.iter()) {
+        assert!((*a - *b).length() < 1e-3, "{a} vs {b}");
+    }
+    assert!((t - s.wall_thickness).abs() < 1e-4 && base.abs() < 1e-4 && (h - s.wall_height).abs() < 1e-4);
+    let wall1 = map.objects.iter().find(|o| o.name == "Wall1").unwrap().id;
+    // outside face of Wall1 (the z = 0 side, facing -Z), clicked at y = 5.3
+    let out = crate::trim::trim_plan(&map, wall1, Vec3::new(10.0, 5.3, -0.5), Vec3::new(0.0, 0.0, -1.0), 0.8, 0.25, 1.0, [200; 3]).unwrap();
+    assert!(out.len() >= 5, "wraps all the way around: {}", out.len());
+    assert!(out.iter().all(|o| o.folder == Some(f) && o.name.contains("Outside")));
+    let bb = |objs: &[Object]| {
+        objs.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), o| {
+            let m = crate::mesh::world_mesh(o, &[], &mut ModelCache::default());
+            m.pos.iter().fold((a, b), |(a, b), p| (a.min(*p), b.max(*p)))
+        })
+    };
+    let (mn, mx) = bb(&out);
+    assert!((mn.x + 0.75).abs() < 1e-3 && (mn.z + 0.75).abs() < 1e-3 && (mx.x - 20.75).abs() < 1e-3 && (mx.z - 16.75).abs() < 1e-3, "sits on the outside faces: {mn} {mx}");
+    assert!((mn.y - 5.0).abs() < 1e-4 && (mx.y - 5.8).abs() < 1e-4, "height snapped: {mn} {mx}");
+    // inside face: a band inside the walls
+    let ins = crate::trim::trim_plan(&map, wall1, Vec3::new(10.0, 0.2, 0.5), Vec3::new(0.0, 0.0, 1.0), 0.8, 0.25, 1.0, [200; 3]).unwrap();
+    let (mn, mx) = bb(&ins);
+    assert!(ins.iter().all(|o| o.name.contains("Inside")));
+    assert!((mn.x - 0.5).abs() < 1e-3 && (mn.z - 0.5).abs() < 1e-3 && (mx.x - 19.5).abs() < 1e-3, "on the inside faces: {mn} {mx}");
+    assert!(mn.y.abs() < 1e-4, "clicked low = baseboard on the floor: {mn}");
+    // the top of a wall is refused
+    assert!(crate::trim::trim_plan(&map, wall1, Vec3::new(10.0, 12.0, 0.0), Vec3::Y, 0.8, 0.25, 1.0, [200; 3]).is_err());
+    // a lone rotated wall: a strip on the clicked face, its whole length
+    let mut w = Object::brush(Shape::Box, Vec3::new(10.0, 8.0, 1.0), Vec3::new(50.0, 4.0, 0.0), [200; 3], Material::Concrete);
+    w.rot.y = 30.0;
+    let wid = map.add(w.clone());
+    let n = w.rotation() * Vec3::Z;
+    let hit = w.to_world(Vec3::new(2.0, 1.0, 0.5));
+    let strip = crate::trim::trim_plan(&map, wid, hit, n, 0.8, 0.25, 1.0, [200; 3]).unwrap();
+    assert_eq!(strip.len(), 1);
+    let Kind::Brush { size, .. } = strip[0].kind else { panic!() };
+    assert!((size - Vec3::new(10.0, 0.8, 0.25)).length() < 1e-4, "{size}");
+    let local = w.to_local(strip[0].pos);
+    assert!((local.z - 0.625).abs() < 1e-4 && local.x.abs() < 1e-4, "on the face: {local}");
+}
+
+#[test]
+fn building_lines_stay_straight() {
+    use crate::previews::straighten;
+    let o = Vec3::new(2.0, 0.0, 3.0);
+    // almost along X: flat along X, length on the grid
+    assert_eq!(straighten(o, Vec3::new(9.7, 0.0, 3.6), 1.0), Vec3::new(12.0 - 2.0, 0.0, 3.0));
+    // almost diagonal: an exact 45° line, same grid steps on both axes
+    let p = straighten(o, Vec3::new(6.2, 0.0, 6.9), 1.0);
+    assert!(((p.x - o.x) - (p.z - o.z)).abs() < 1e-5 && (p.x - o.x - 4.0).abs() < 1e-5, "{p}");
+    // backwards along -Z
+    assert_eq!(straighten(o, Vec3::new(2.4, 0.0, -5.2), 1.0), Vec3::new(2.0, 0.0, -5.0));
+    // no grid: keeps the length
+    let p = straighten(Vec3::ZERO, Vec3::new(3.3, 0.0, 0.2), 0.0);
+    assert!((p - Vec3::new(3.3, 0.0, 0.0)).length() < 1e-5, "{p}");
+}
+
+/// Timing for a busy map: `cargo test --release bench_busy_map -- --ignored --nocapture`
+/// (ANVIL_BENCH_MODEL = a real model file to scatter instead of spheres).
+#[test]
+#[ignore]
+fn bench_busy_map() {
+    use crate::view3d::{Camera, RenderOpts, Renderer};
+    let mut map = Map::default();
+    let s = crate::settings::Settings::default();
+    // 6 buildings
+    for b in 0..6 {
+        let ox = (b % 3) as f32 * 40.0;
+        let oz = (b / 3) as f32 * 40.0;
+        let pts = [Vec3::new(ox, 0.0, oz), Vec3::new(ox + 24.0, 0.0, oz), Vec3::new(ox + 24.0, 0.0, oz + 18.0), Vec3::new(ox, 0.0, oz + 18.0)];
+        for o in crate::building::house_objects(&pts, &s, 0.0, None, None) {
+            map.add(o);
+        }
+    }
+    map.add(Object::brush(Shape::Box, Vec3::new(400.0, 1.0, 400.0), Vec3::new(40.0, -1.5, 20.0), [90, 110, 70], Material::Grass));
+    let model = std::env::var("ANVIL_BENCH_MODEL").ok();
+    for i in 0..150 {
+        let p = Vec3::new((i % 15) as f32 * 8.0 - 10.0, 0.0, (i / 15) as f32 * 8.0 - 12.0);
+        let o = match &model {
+            Some(m) => Object::new(Kind::Prop { model: m.clone(), scale: Vec3::splat(2.0), roblox_mesh_id: String::new() }, p, [200; 3], Material::Plastic),
+            None => {
+                let mut o = Object::brush(Shape::Sphere, Vec3::splat(2.0), p + Vec3::Y, [180, 120, 90], Material::Plastic);
+                if let Kind::Brush { steps, .. } = &mut o.kind {
+                    *steps = 64;
+                }
+                o
+            }
+        };
+        map.add(o);
+    }
+    let mut models = ModelCache::default();
+    let t = std::time::Instant::now();
+    let mut sc = crate::mesh::SceneCache::default();
+    let scene = sc.build(&map, &mut models);
+    let tris: usize = scene.iter().map(|w| w.mesh.tris.len()).sum();
+    println!("BENCH scene: {} objects, {} triangles, built in {:?}", scene.len(), tris, t.elapsed());
+    let t = std::time::Instant::now();
+    let _ = sc.build(&map, &mut models);
+    println!("BENCH scene rebuild (nothing changed): {:?}", t.elapsed());
+    let ctx = eframe::egui::Context::default();
+    let rect = eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::vec2(1280.0, 720.0));
+    let mut tc = crate::texture::TexCache::default();
+    for (name, eye, at, lit) in [("overview", Vec3::new(-30.0, 30.0, -40.0), Vec3::new(40.0, 0.0, 30.0), false), ("street", Vec3::new(-14.0, 5.0, -16.0), Vec3::new(60.0, 3.0, 50.0), false), ("street lit", Vec3::new(-14.0, 5.0, -16.0), Vec3::new(60.0, 3.0, 50.0), true)] {
+        let cam = Camera::looking_at(eye, at);
+        let mut opts = RenderOpts { fov: 70.0, grid: 1.0, plane_y: 0.0, show_grid: true, outlines: true, bg: [58, 66, 80], scale: 1.0, filter: true, lighting: Default::default() };
+        opts.lighting.on = lit;
+        let mut r = Renderer::default();
+        r.render(&ctx, rect, &cam, &opts, &scene, &[], &HashMap::new(), &mut tc);
+        let n = 5;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            r.render(&ctx, rect, &cam, &opts, &scene, &[], &HashMap::new(), &mut tc);
+        }
+        println!("BENCH {name}: {:?} per frame", t.elapsed() / n);
+        let (w, h, px) = r.pixels();
+        write_png(&out_dir("bench").join(format!("{}.png", name.replace(' ', "_"))), w, h, px);
+    }
+}
+
+/// Far away, detailed models are drawn from a simplified version: it must
+/// look (almost) the same as the full one, and be much lighter.
+#[test]
+fn far_detail_lods_look_the_same() {
+    use crate::view3d::{Camera, RenderOpts, Renderer};
+    // a bumpy 80x80 sheet: 12,800 triangles
+    let n = 80usize;
+    let mut verts = Vec::new();
+    let mut faces = Vec::new();
+    for z in 0..=n {
+        for x in 0..=n {
+            let (fx, fz) = (x as f32 / n as f32 * 10.0 - 5.0, z as f32 / n as f32 * 10.0 - 5.0);
+            verts.push(Vec3::new(fx, (fx * 1.3).sin() * (fz * 0.9).cos() * 1.5, fz));
+        }
+    }
+    for z in 0..n {
+        for x in 0..n {
+            let i = (z * (n + 1) + x) as u32;
+            faces.push(vec![i, i + (n as u32 + 1), i + n as u32 + 2, i + 1]);
+        }
+    }
+    let mut map = Map::default();
+    map.add(Object::new(Kind::Mesh { verts, faces }, Vec3::new(0.0, 2.0, 0.0), [200, 160, 120], Material::Plastic));
+    let mut mc = ModelCache::default();
+    let full = crate::mesh::world_mesh(&map.objects[0], &[], &mut mc);
+    assert!(full.mesh.tris.len() >= 12_800);
+    assert!(!full.lods.is_empty(), "a detailed model gets simpler versions");
+    assert!(full.lods.last().unwrap().tris.len() * 10 < full.mesh.tris.len(), "the coarsest is much lighter: {}", full.lods.last().unwrap().tris.len());
+    let with_lod = vec![std::sync::Arc::new(full)];
+    let mut plain = crate::mesh::world_mesh(&map.objects[0], &[], &mut mc);
+    plain.lods = std::sync::Arc::new(Vec::new());
+    let without = vec![std::sync::Arc::new(plain)];
+    let ctx = eframe::egui::Context::default();
+    let rect = eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::vec2(640.0, 360.0));
+    for dist in [30.0f32, 90.0, 250.0] {
+        let cam = Camera::looking_at(Vec3::new(0.0, dist * 0.5, dist), Vec3::new(0.0, 2.0, 0.0));
+        let opts = RenderOpts { fov: 70.0, grid: 1.0, plane_y: 0.0, show_grid: false, outlines: false, bg: [0, 0, 0], scale: 1.0, filter: true, lighting: Default::default() };
+        let shot = |scene: &[std::sync::Arc<crate::mesh::WorldMesh>]| {
+            let mut r = Renderer::default();
+            r.render(&ctx, rect, &cam, &opts, scene, &[], &HashMap::new(), &mut crate::texture::TexCache::default());
+            r.pixels().2.chunks_exact(4).map(|p| p[0] > 0 || p[1] > 0 || p[2] > 0).collect::<Vec<bool>>()
+        };
+        let (a, b) = (shot(&with_lod), shot(&without));
+        let covered = b.iter().filter(|x| **x).count();
+        let diff = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        assert!(covered > 20, "visible at {dist}");
+        println!("LOD at {dist}: {diff} of {covered} pixels differ");
+        assert!(diff * 100 <= covered * 6 + 800, "at distance {dist}: {diff} of {covered} pixels differ");
+    }
+}

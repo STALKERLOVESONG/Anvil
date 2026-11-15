@@ -43,6 +43,7 @@ mod text;
 mod updater;
 mod themes;
 mod tool_panel;
+mod trim;
 mod thumbs;
 mod uv_editor;
 mod texture;

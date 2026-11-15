@@ -527,6 +527,15 @@ impl Renderer {
         // pass 1 (row bands in parallel): background, grid, solid surfaces
         let bg = [o.bg[0], o.bg[1], o.bg[2], 255];
         let rows = (h / (rayon::current_num_threads() * 4)).clamp(4, 64);
+        // which triangles / lines touch each band, so a band only looks at those
+        let nb = h.div_ceil(rows);
+        let tri_y = |t: &RTri| (t.p[0].y.min(t.p[1].y).min(t.p[2].y), t.p[0].y.max(t.p[1].y).max(t.p[2].y));
+        let line_y = |l: &RLine| (l.a.y.min(l.b.y), l.a.y.max(l.b.y));
+        let b_grid = bin(&frame.grid, nb, rows, line_y);
+        let b_opaque = bin(&frame.opaque, nb, rows, tri_y);
+        let b_outlines = bin(&frame.outlines, nb, rows, line_y);
+        let b_deferred = bin(&frame.deferred, nb, rows, |d| tri_y(&d.1));
+        let b_sel = bin(&frame.sel, nb, rows, line_y);
         let frame = &frame;
         let o = &*o;
         self.color.par_chunks_mut(w * 4 * rows).zip(self.depth.par_chunks_mut(w * rows)).enumerate().for_each(|(bi, (cb, db))| {
@@ -548,11 +557,11 @@ impl Renderer {
             }
             db.fill(0.0);
             let mut band = Band { w, y0, rows: db.len() / w, color: cb, depth: db, ortho, bilinear: o.filter, lit: lc };
-            for l in &frame.grid {
-                band.line(l);
+            for &i in &b_grid[bi] {
+                band.line(&frame.grid[i as usize]);
             }
-            for t in &frame.opaque {
-                band.fill(t, true);
+            for &i in &b_opaque[bi] {
+                band.fill(&frame.opaque[i as usize], true);
             }
         });
 
@@ -567,14 +576,14 @@ impl Renderer {
         // pass 3: outlines, see-through objects, selection
         self.color.par_chunks_mut(w * 4 * rows).zip(self.depth.par_chunks_mut(w * rows)).enumerate().for_each(|(bi, (cb, db))| {
             let mut band = Band { w, y0: bi * rows, rows: db.len() / w, color: cb, depth: db, ortho, bilinear: o.filter, lit: lc };
-            for l in &frame.outlines {
-                band.line(l);
+            for &i in &b_outlines[bi] {
+                band.line(&frame.outlines[i as usize]);
             }
-            for (_, t) in &frame.deferred {
-                band.fill(t, false);
+            for &i in &b_deferred[bi] {
+                band.fill(&frame.deferred[i as usize].1, false);
             }
-            for l in &frame.sel {
-                band.line(l);
+            for &i in &b_sel[bi] {
+                band.line(&frame.sel[i as usize]);
             }
         });
 
@@ -590,6 +599,25 @@ impl Renderer {
     pub fn pixels(&self) -> (usize, usize, &[u8]) {
         (self.w, self.h, &self.color)
     }
+}
+
+/// For each band of `rows` rows, the indices of the items whose y range
+/// (in pixels) reaches it, in their original order.
+fn bin<T>(items: &[T], nb: usize, rows: usize, yr: impl Fn(&T) -> (f32, f32)) -> Vec<Vec<u32>> {
+    let mut out = vec![Vec::new(); nb.max(1)];
+    let last = out.len() - 1;
+    for (i, it) in items.iter().enumerate() {
+        let (a, b) = yr(it);
+        if !(a <= b) {
+            continue;
+        }
+        let lo = ((a.floor().max(0.0) as usize) / rows).min(last);
+        let hi = ((b.ceil().max(0.0) as usize) / rows).min(last);
+        for band in &mut out[lo..=hi] {
+            band.push(i as u32);
+        }
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -666,29 +694,62 @@ fn build_frame(
         }
     }
 
-    for wm in scene {
-        let sel = selected.contains(&wm.id);
-        let vs: Vec<Vec3> = wm.pos.iter().map(|p| cam.to_view(*p, &basis)).collect();
-        if !vs.iter().any(|v| v.z >= NEAR) {
-            continue;
+    // what's on screen: each object's box against the view frustum, and
+    // objects too far away to cover a pixel are skipped (selected ones stay)
+    let (wf, hf) = (w as f32, h as f32);
+    let (hx, hy) = (cx / k, cy / k);
+    let on_screen = |wm: &WorldMesh| -> bool {
+        let corners: Vec<Vec3> = (0..8)
+            .map(|i| cam.to_view(Vec3::new(if i & 1 != 0 { wm.max.x } else { wm.min.x }, if i & 2 != 0 { wm.max.y } else { wm.min.y }, if i & 4 != 0 { wm.max.z } else { wm.min.z }), &basis))
+            .collect();
+        let out = |f: &dyn Fn(Vec3) -> bool| corners.iter().all(|v| f(*v));
+        if ortho {
+            if out(&|v| v.x > hx) || out(&|v| v.x < -hx) || out(&|v| v.y > hy) || out(&|v| v.y < -hy) || out(&|v| v.z < NEAR) {
+                return false;
+            }
+        } else if out(&|v| v.z < NEAR) || out(&|v| v.x > v.z * hx) || out(&|v| -v.x > v.z * hx) || out(&|v| v.y > v.z * hy) || out(&|v| -v.y > v.z * hy) {
+            return false;
         }
-        // one shared Paint per texture slot
-        let paints: Vec<Option<Arc<Paint>>> = wm
-            .texs
-            .iter()
-            .map(|t| {
-                textures.get(&t.image).map(|tex| {
-                    Arc::new(Paint {
-                        tint: [t.tint[0] as f32, t.tint[1] as f32, t.tint[2] as f32],
-                        alpha: wm.alpha,
-                        tex,
-                        nrm: if wm.tri_tbn.len() == wm.mesh.tris.len() { textures.get(&t.normal) } else { None },
-                        metallic: t.metallic,
-                        decal: wm.decal,
+        if selected.contains(&wm.id) || remote_sel.contains_key(&wm.id) {
+            return true;
+        }
+        let r = (wm.max - wm.min).length() * 0.5;
+        let c = cam.to_view((wm.min + wm.max) * 0.5, &basis);
+        let px = if ortho { r * k } else if c.z > r + NEAR { r * k / c.z } else { f32::MAX };
+        px >= 0.35
+    };
+    // one shared Paint per texture slot (loading textures needs the cache, so
+    // this part runs first, one object after another)
+    let visible: Vec<(&Arc<WorldMesh>, Vec<Option<Arc<Paint>>>)> = scene
+        .iter()
+        .filter(|wm| on_screen(wm))
+        .map(|wm| {
+            let paints = wm
+                .texs
+                .iter()
+                .map(|t| {
+                    textures.get(&t.image).map(|tex| {
+                        Arc::new(Paint {
+                            tint: [t.tint[0] as f32, t.tint[1] as f32, t.tint[2] as f32],
+                            alpha: wm.alpha,
+                            tex,
+                            nrm: if wm.tri_tbn.len() == wm.mesh.tris.len() { textures.get(&t.normal) } else { None },
+                            metallic: t.metallic,
+                            decal: wm.decal,
+                        })
                     })
                 })
-            })
-            .collect();
+                .collect();
+            (wm, paints)
+        })
+        .collect();
+    // triangle setup for all objects in parallel
+    let parts: Vec<Frame> = visible
+        .into_par_iter()
+        .map(|(wm, paints)| {
+            let mut part = Frame::default();
+        let sel = selected.contains(&wm.id);
+        let vs: Vec<Vec3> = wm.pos.iter().map(|p| cam.to_view(*p, &basis)).collect();
         let has_uv = wm.tri_uv.len() == wm.mesh.tris.len();
         // point lights that can reach this object at all
         let obj_lights: u64 = if o.lighting.on {
@@ -699,7 +760,25 @@ fn build_frame(
         };
         let deferred_obj = wm.alpha < 0.999 || wm.decal;
         let base = [wm.color[0] as f32, wm.color[1] as f32, wm.color[2] as f32];
-        for (ti, t) in wm.mesh.tris.iter().enumerate() {
+        // far away, a detailed model is drawn from a simpler version whose
+        // merged vertices are at most ~1.5 pixels apart on screen
+        let near_z = if ortho {
+            1.0
+        } else {
+            let c = cam.to_view((wm.min + wm.max) * 0.5, &basis);
+            (c.z - (wm.max - wm.min).length() * 0.5).max(NEAR)
+        };
+        let lod = wm.lods.iter().rev().find(|l| l.cell * wm.lod_scale * k / near_z < 1.5);
+        let all: Vec<(u32, [u32; 3])>;
+        let tri_list: &[(u32, [u32; 3])] = match lod {
+            Some(l) => &l.tris,
+            None => {
+                all = wm.mesh.tris.iter().enumerate().map(|(i, t)| (i as u32, *t)).collect();
+                &all
+            }
+        };
+        for &(ti, t) in tri_list {
+            let ti = ti as usize;
             let (i0, i1, i2) = (t[0] as usize, t[1] as usize, t[2] as usize);
             let (a, b, c) = (wm.pos[i0], wm.pos[i1], wm.pos[i2]);
             let n = (b - a).cross(c - a);
@@ -733,6 +812,17 @@ fn build_frame(
                 pp[q] = p;
                 ww[q] = wq;
                 uvw[q] = poly[q].1 * wq;
+            }
+            // off screen, or so small it covers no pixel center: nothing to draw
+            let (mut mnx, mut mxx, mut mny, mut mxy) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+            for q in pp.iter().take(cnt) {
+                mnx = mnx.min(q.x);
+                mxx = mxx.max(q.x);
+                mny = mny.min(q.y);
+                mxy = mxy.max(q.y);
+            }
+            if mxx < 0.0 || mxy < 0.0 || mnx > wf || mny > hf || (mnx - 0.5).ceil() > (mxx - 0.5).floor() || (mny - 0.5).ceil() > (mxy - 0.5).floor() {
+                continue;
             }
             let kf = light(n, metallic);
             let depth = (tri[0].z + tri[1].z + tri[2].z) / 3.0;
@@ -779,9 +869,9 @@ fn build_frame(
                 };
                 let rt = RTri { p: [pp[0], pp[q], pp[q + 1]], w: [ww[0], ww[q], ww[q + 1]], uvw: [uvw[0], uvw[q], uvw[q + 1]], shade, grad, tsize, n, metallic, lmask };
                 if deferred_obj {
-                    f.deferred.push((depth, rt));
+                    part.deferred.push((depth, rt));
                 } else {
-                    f.opaque.push(rt);
+                    part.opaque.push(rt);
                 }
             }
         }
@@ -789,8 +879,8 @@ fn build_frame(
         let sel_col = if sel { Some([255, 215, 70]) } else { remote_sel.get(&wm.id).copied() };
         if sel_col.is_some() || (o.outlines && !wm.decal) {
             let (col, bias, list) = match sel_col {
-                Some(c) => (c, 1.02, &mut f.sel),
-                None => ([(wm.color[0] as f32 * 0.4) as u8, (wm.color[1] as f32 * 0.4) as u8, (wm.color[2] as f32 * 0.4) as u8], 1.004, &mut f.outlines),
+                Some(c) => (c, 1.02, &mut part.sel),
+                None => ([(wm.color[0] as f32 * 0.4) as u8, (wm.color[1] as f32 * 0.4) as u8, (wm.color[2] as f32 * 0.4) as u8], 1.004, &mut part.outlines),
             };
             for e in &wm.mesh.edges {
                 if let Some((a, b)) = clip_segment(vs[e[0] as usize], vs[e[1] as usize]) {
@@ -798,6 +888,14 @@ fn build_frame(
                 }
             }
         }
+            part
+        })
+        .collect();
+    for p in parts {
+        f.opaque.extend(p.opaque);
+        f.deferred.extend(p.deferred);
+        f.outlines.extend(p.outlines);
+        f.sel.extend(p.sel);
     }
     f.deferred.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     f

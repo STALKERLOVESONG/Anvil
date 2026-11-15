@@ -394,6 +394,9 @@ pub struct ModelCache {
     items: HashMap<String, Result<Arc<TriMesh>, String>>,
     /// Team Create: map path -> local copy (None = not downloaded yet, don't open).
     alias: HashMap<String, Option<String>>,
+    /// Levels of detail per model (built once, shared by every copy placed),
+    /// with the mesh they were built from.
+    lods: HashMap<String, (usize, Arc<Vec<Lod>>)>,
 }
 
 impl ModelCache {
@@ -428,7 +431,26 @@ impl ModelCache {
 
     pub fn forget(&mut self, path: &str) {
         self.items.remove(path);
+        self.lods.remove(path);
     }
+
+    /// Levels of detail for the model at `path` (its local mesh `m`).
+    pub fn lods_for(&mut self, path: &str, m: &Arc<TriMesh>) -> Arc<Vec<Lod>> {
+        let key = Arc::as_ptr(m) as usize;
+        if let Some((k, l)) = self.lods.get(path) {
+            if *k == key {
+                return l.clone();
+            }
+        }
+        let l = Arc::new(local_lods(m));
+        self.lods.insert(path.to_string(), (key, l.clone()));
+        l
+    }
+}
+
+fn local_lods(m: &TriMesh) -> Vec<Lod> {
+    let (mn, mx) = m.pos.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+    build_lods(&m.pos, &m.tris, mn, mx)
 }
 
 fn missing_model() -> TriMesh {
@@ -545,6 +567,67 @@ pub struct WorldMesh {
     pub solid: bool,
     /// Throws a sun shadow (not lights, decals or spawn pads).
     pub cast_shadow: bool,
+    /// Simpler versions for drawing far away, finest first (detailed models
+    /// only). Built in model space: `lod_scale` turns their cell size into world units.
+    pub lods: Arc<Vec<Lod>>,
+    pub lod_scale: f32,
+}
+
+/// A simplified version of a detailed mesh: nearby vertices (within `cell`
+/// world units) merged into one. Each entry is (original triangle, its
+/// corners after merging), so per-triangle UVs / textures still apply.
+pub struct Lod {
+    pub cell: f32,
+    pub tris: Vec<(u32, [u32; 3])>,
+}
+
+/// Models with fewer triangles than this are always drawn in full.
+const LOD_MIN_TRIS: usize = 1500;
+
+/// Vertex-clustering levels of detail for a world-space mesh.
+pub fn build_lods(pos: &[Vec3], tris: &[[u32; 3]], min: Vec3, max: Vec3) -> Vec<Lod> {
+    let mut out: Vec<Lod> = Vec::new();
+    if tris.len() < LOD_MIN_TRIS {
+        return out;
+    }
+    let diag = (max - min).length();
+    if diag <= 0.0 || !diag.is_finite() {
+        return out;
+    }
+    let mut last = tris.len();
+    for div in [160.0f32, 64.0, 24.0, 8.0] {
+        let cell = diag / div;
+        let mut rep: HashMap<(i32, i32, i32), u32> = HashMap::new();
+        let map: Vec<u32> = pos
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let c = ((p.x - min.x) / cell).floor() as i32;
+                let d = ((p.y - min.y) / cell).floor() as i32;
+                let e = ((p.z - min.z) / cell).floor() as i32;
+                *rep.entry((c, d, e)).or_insert(i as u32)
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        let mut lt = Vec::new();
+        for (ti, t) in tris.iter().enumerate() {
+            let r = [map[t[0] as usize], map[t[1] as usize], map[t[2] as usize]];
+            if r[0] == r[1] || r[1] == r[2] || r[0] == r[2] {
+                continue;
+            }
+            let mut key = r;
+            key.sort_unstable();
+            if seen.insert(key) {
+                lt.push((ti as u32, r));
+            }
+        }
+        // only worth keeping if it's clearly simpler than the level before
+        if lt.len() * 10 < last * 7 {
+            last = lt.len();
+            out.push(Lod { cell, tris: lt });
+        }
+    }
+    out
 }
 
 pub fn world_mesh(obj: &Object, textures: &[TextureDef], cache: &mut ModelCache) -> WorldMesh {
@@ -631,6 +714,12 @@ pub fn world_mesh(obj: &Object, textures: &[TextureDef], cache: &mut ModelCache)
         }
     }
     let solid = obj.collide && !matches!(obj.kind, Kind::Light { .. } | Kind::Decal { .. });
+    let lods = match &obj.kind {
+        _ if decal || mesh.tris.len() < LOD_MIN_TRIS => Arc::new(Vec::new()),
+        Kind::Prop { model, .. } => cache.lods_for(model, &mesh),
+        _ => Arc::new(local_lods(&mesh)),
+    };
+    let lod_scale = obj.scale().abs().max_element();
     WorldMesh {
         id: obj.id,
         mesh,
@@ -646,6 +735,8 @@ pub fn world_mesh(obj: &Object, textures: &[TextureDef], cache: &mut ModelCache)
         decal,
         solid,
         cast_shadow: !matches!(obj.kind, Kind::Light { .. } | Kind::Decal { .. } | Kind::Spawn { .. } | Kind::Prompt { .. } | Kind::Target {}),
+        lods,
+        lod_scale,
     }
 }
 

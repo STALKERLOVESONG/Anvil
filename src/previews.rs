@@ -142,7 +142,7 @@ impl AnvilApp {
         self.ghost.touched = false;
     }
 
-    /// Ghost / opening hover handling for the 3D view (call with the hover position).
+        /// Ghost / opening hover handling for the 3D view (call with the hover position).
     pub(crate) fn hover_3d(&mut self, rect: Rect, scene: &[Arc<WorldMesh>], hover: Option<Pos2>, free: bool) {
         let Some(h) = hover else { return };
         let fov = self.settings.fov;
@@ -234,6 +234,14 @@ impl AnvilApp {
                 }
             }
         }
+        if let (Some(h), Tool::Trim) = (hover, self.tool) {
+            let (o, d) = self.cam.ray(rect, fov, h);
+            if let Some(hit) = pick_ray(scene, o, d) {
+                for (p, q) in self.trim_preview(hit.id, hit.point, hit.normal, !free) {
+                    seg(p, q, Stroke::new(if pressed { 2.0f32 } else { 1.2 }, OPEN_COL));
+                }
+            }
+        }
         self.paint_ghost(|a, b| seg(a, b, Stroke::new(1.0f32, GHOST_COL.gamma_multiply(0.8))));
     }
 
@@ -284,6 +292,46 @@ impl AnvilApp {
             for e in &g.mesh.edges {
                 seg(g.pos[e[0] as usize], g.pos[e[1] as usize]);
             }
+        }
+    }
+}
+
+/// Keeps a line from `from` to `to` straight: its direction snaps to the
+/// nearest 45° step and its length to the grid (`g`, 0 = no grid).
+pub fn straighten(from: Vec3, to: Vec3, g: f32) -> Vec3 {
+    let d = Vec3::new(to.x - from.x, 0.0, to.z - from.z);
+    if d.length() < 1e-5 {
+        return Vec3::new(from.x, to.y, from.z);
+    }
+    let step = std::f32::consts::FRAC_PI_4;
+    let k = ((d.z.atan2(d.x) / step).round() as i32).rem_euclid(8);
+    let (sx, sz) = [(1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (-1.0, 1.0), (-1.0, 0.0), (-1.0, -1.0), (0.0, -1.0), (1.0, -1.0)][k as usize];
+    let dir = Vec3::new(sx, 0.0, sz).normalize();
+    let along = d.dot(dir).max(0.0);
+    // move the same grid amount along each axis the line uses
+    let m = if sx != 0.0 && sz != 0.0 { along / std::f32::consts::SQRT_2 } else { along };
+    let m = if g > 0.0 { (m / g).round() * g } else { m };
+    Vec3::new(from.x + sx * m, to.y, from.z + sz * m)
+}
+
+impl AnvilApp {
+    /// Where the next Building / Polygon corner goes for a raw point:
+    /// a straight line from the last corner (unless `free`), on the grid.
+    pub(crate) fn straight_point(&self, raw: Vec3, free: bool) -> Vec3 {
+        let g = self.snap_step();
+        match self.layout_pts.last() {
+            Some(last) if !free => straighten(*last, raw, g),
+            _ => Vec3::new(snap(raw.x, g), raw.y, snap(raw.z, g)),
+        }
+    }
+
+    /// End of a wall being drawn from `start`: straight (45° steps) unless `free`.
+    pub(crate) fn straight_end(&self, start: Vec3, raw: Vec3, free: bool) -> Vec3 {
+        let g = self.snap_step();
+        if free {
+            Vec3::new(snap(raw.x, g), raw.y, snap(raw.z, g))
+        } else {
+            straighten(start, raw, g)
         }
     }
 }

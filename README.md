@@ -29,7 +29,7 @@ Blender.
 ## Features
 
 - **Building:**
-  - Brushes and presets, walls, and whole buildings from an outline (with floor, ceiling
+  - Brushes, walls, and whole buildings from an outline (with floor, ceiling
     and trim).
   - Doors and windows as real boolean holes, on walls and meshes.
   - Stairs with railings, a knife, mesh union / subtract / intersect, 3D text from any
@@ -93,13 +93,14 @@ PCs without it, the title uses the normal font. Click the logo for About.
 | Key | Tool | What it does |
 |---|---|---|
 | 1 | Select | Click to select. Shift or Ctrl+click adds. Drag to move, drag the handles to resize (Shift = even on all axes), Shift+drag clones. |
-| 2 | Block | Drag a rectangle to draw a brush (Shift = perfect square), or click to drop the active preset |
-| 3 | Wall | Drag a line in the Top or 3D view |
-| 4 | **Building** | Shift+drag two corners for an exact rectangle (add Alt for a square), or click the corners of a closed loop. Click the first point, double-click or press Enter to close it. This builds walls (corners overlap cleanly) plus an optional floor and ceiling, all in a new folder. |
+| 2 | Block | Drag a rectangle to draw a brush (Shift = perfect square) |
+| 3 | Wall | Drag a line in the Top or 3D view. It stays straight (every 45°); hold Ctrl for any angle. |
+| 4 | **Building** | **Drag a box** for a rectangular building (add Alt for a square), or click the corners of a closed loop: each line stays straight (every 45°, Ctrl = any angle). Click the first point, double-click or press Enter to close it. This builds walls (corners overlap cleanly) plus an optional floor and ceiling that sit flush with the outside of the walls, all in a new folder. |
 | 5 | **Polygon** | Same loop. Once it's closed, move the mouse to set the height live (snaps; Ctrl = free), then click to build one extruded mesh you can edit. Esc cancels. |
 | 6 | **Door** | Click a wall to cut a door-shaped boolean hole (works on meshes and odd-shaped brushes too: the opening lines up with the face you click). On a floor it cuts a hatch. Hovering shows where it'll go; hold the mouse down to see it clearly and slide it, then let go to cut. Ctrl = no snapping. |
 | 7 | **Window** | Same as Door, for a window hole with an optional glass pane (the preview shows both) |
-| 8 | Prop | Place a library model (.obj / .stl / .glb / .gltf). A see-through ghost shows where it'll land, in every view. Presets, lights and spawns get a ghost too. |
+| - | **Trim** | Click a wall to run a trim strip along it at that height: near the bottom for a baseboard, the top for a crown, anywhere between for a stripe. On a building it wraps the whole way around, outside or inside (whichever face you click), with clean corners. Doors and windows cut through it. Height, depth and color are in the tool panel. |
+| 8 | Prop | Place a library model (.obj / .stl / .glb / .gltf). A see-through ghost shows where it'll land, in every view. Lights and spawns get a ghost too. |
 | 9 | **Decal** | Click a wall or floor to stick a textured plane on it (dirt, posters, papers) |
 | 0 | Light | Point light |
 | - | Spawn | Flat spawn pad (playtest starts here). Visible in the editor, invisible in the exported game. |
@@ -167,7 +168,8 @@ The 3D view's header has **Persp / Top / Bottom / Front / Back / Left / Right**.
   - **Other tools:** light range and brightness, spawn and decal size, polygon height,
     knife mode, text, and stairs.
 - **Building trim:** tick *Baseboard* and/or *Crown* and the Building tool adds strips
-  along the inside of the walls, with clean corners. Doors and windows cut through any
+  along the inside of the walls, with clean corners. For trim anywhere else (outside,
+  mid-wall, on a single wall), use the **Trim** tool. Doors and windows cut through any
   trim they overlap.
 - **Themes:** View → Theme (or Settings > Look) offers Dark, Light, Hammer grey, Midnight
   blue and High contrast, plus an accent color.

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.4
+
+- **Much faster 3D view on big maps.** A map with 150 detailed props (3.3 million
+  triangles) went from 1.2 seconds per frame to about 10-20 ms.
+  - Objects off screen or too small to see are skipped.
+  - Far away, detailed models are drawn from simpler versions (no visible difference).
+  - Triangles are set up on all CPU cores.
+  - Each part of the screen only looks at the triangles that touch it.
+  - The 2D views draw detailed props as boxes once there are too many lines to draw.
+- **Building tool:**
+  - Floor and ceiling now cover the walls' full outline, flush with the outside (they
+    stopped half a wall short before, leaving a step).
+  - Drag a box for a rectangular building (Shift isn't needed any more).
+  - Clicked corners keep lines straight (every 45°); Ctrl for any angle. The Wall tool
+    works the same way.
+- **New Trim tool:** click a wall to add trim at that height. On a building it wraps the
+  whole way around, inside or outside.
+- The Presets list is gone from the side panel.
+
 ## 0.2.3
 
 - **Team Create:** props now arrive textured. Each prop's `.mtl` and texture images are
