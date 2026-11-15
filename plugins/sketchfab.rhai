@@ -56,23 +56,25 @@ fn search() {
 fn start_download(uid, name) {
     let token = secret_get("token");
     if token == "" { state_set("msg", "Save your Sketchfab API token first (top of this window)."); return; }
-    let body = http_get("https://api.sketchfab.com/v3/models/" + uid + "/download", #{ Authorization: "Token " + token });
-    let d = json_parse(body);
+    // Personal API tokens use "Token ...", OAuth tokens "Bearer ...": try both.
+    let api = "https://api.sketchfab.com/v3/models/" + uid + "/download";
+    let d = json_parse(http_get(api, #{ Authorization: "Token " + token }));
+    if type_of(d) != "map" || (type_of(d.gltf) != "map" && type_of(d.glb) != "map") {
+        d = json_parse(http_get(api, #{ Authorization: "Bearer " + token }));
+    }
     if type_of(d) != "map" {
         state_set("msg", "Sketchfab didn't give a download (wrong token, or the model isn't downloadable).");
         return;
     }
-    let safe = "";
-    for ch in name.to_chars() {
-        if safe.len() < 40 { safe += if ch.is_alphanumeric() { ch.to_string() } else { "_" }; }
-    }
+    // Anvil cleans up the file name itself (safe characters, keeps the extension)
+    let file = uid + "_" + name;
     let job = -1;
     let kind = "";
     if type_of(d.glb) == "map" {
-        job = download(d.glb.url, safe + "_" + uid + ".glb");
+        job = download(d.glb.url, file + ".glb");
         kind = "glb";
     } else if type_of(d.gltf) == "map" {
-        job = download(d.gltf.url, safe + "_" + uid + ".zip");
+        job = download(d.gltf.url, file + ".zip");
         kind = "zip";
     } else {
         state_set("msg", "No glTF download for this model.");

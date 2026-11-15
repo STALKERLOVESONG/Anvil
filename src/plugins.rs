@@ -39,14 +39,19 @@ pub const TEMPLATE: &str = include_str!("../plugins/template.rhai");
 
 /// FNV-1a hashes of older bundled plugin versions. An installed file that
 /// still matches one of these was never edited, so it's safe to upgrade.
-const OLD_BUILTINS: [(&str, u64); 3] = [
+/// Earlier bundled versions (FNV-1a of the exact file). A plugins-folder copy
+/// that matches one of these is replaced with the new version on start.
+/// Every released version must be listed (a test checks the git tags).
+pub(crate) const OLD_BUILTINS: [(&str, u64); 4] = [
     ("transform_gizmo.rhai", 0x732b_1b31_58d1_2ad5),
     ("transform_gizmo.rhai", 0x718d_635e_b156_c31e),
-    // 0.2.0's Sketchfab plugin: saving the token failed (Rhai trim() returns nothing)
+    // 0.2.0: saving the token failed (Rhai's trim() returns nothing)
     ("sketchfab.rhai", 0xf97e_6b8e_ce81_0d54),
+    // 0.2.1: downloading failed (Rhai has no char is_alphanumeric)
+    ("sketchfab.rhai", 0x9c62_f9af_0608_4fe4),
 ];
 
-fn fnv(b: &[u8]) -> u64 {
+pub(crate) fn fnv(b: &[u8]) -> u64 {
     b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| (h ^ *x as u64).wrapping_mul(0x100_0000_01b3))
 }
 

@@ -2231,6 +2231,20 @@ fn gltf_models_load_with_transforms_and_textures() {
 mod plugin_web_api {
     use crate::plugin_web::*;
 
+    /// The Sketchfab tests share one saved token, so they take turns.
+    static SKETCHFAB: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A plugin host with the bundled Sketchfab plugin freshly installed
+    /// (ignores whatever copy an earlier test run left in the folder).
+    fn sketchfab_host() -> (crate::plugins::PluginHost, usize) {
+        let mut host = crate::plugins::PluginHost::new();
+        let _ = std::fs::remove_file(host.dir.join("sketchfab.rhai"));
+        host.install_builtins();
+        host.reload();
+        let idx = host.plugins.iter().position(|p| p.file == "sketchfab.rhai").expect("bundled Sketchfab plugin loads");
+        (host, idx)
+    }
+
     #[test]
     fn hosts_are_fenced() {
         let hosts = vec!["api.sketchfab.com".to_string()];
@@ -2270,8 +2284,8 @@ mod plugin_web_api {
 
     #[test]
     fn panel_plugin_loads_and_draws() {
-        let mut host = crate::plugins::PluginHost::new();
-        let idx = host.plugins.iter().position(|p| p.file == "sketchfab.rhai").expect("bundled");
+        let _turn = SKETCHFAB.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut host, idx) = sketchfab_host();
         assert_eq!(host.plugins[idx].kind, crate::plugins::PluginKind::Panel);
         assert!(host.plugins[idx].hosts.contains(&"api.sketchfab.com".to_string()));
         let (w, _) = host.panel(idx, &crate::map::Map::default(), &crate::mesh::ModelCache::default(), 1.0);
@@ -2282,8 +2296,8 @@ mod plugin_web_api {
 
     #[test]
     fn sketchfab_token_saves_and_forgets() {
-        let mut host = crate::plugins::PluginHost::new();
-        let idx = host.plugins.iter().position(|p| p.file == "sketchfab.rhai").unwrap();
+        let _turn = SKETCHFAB.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut host, idx) = sketchfab_host();
         let (map, models) = (crate::map::Map::default(), crate::mesh::ModelCache::default());
         let ev = |host: &mut crate::plugins::PluginHost, id: &str, v: &str| host.panel_event(idx, &map, &models, 1.0, id, v);
         let out = ev(&mut host, "token_in", "  test-token-123  ");
@@ -2298,11 +2312,181 @@ mod plugin_web_api {
         assert_eq!(secret_get("sketchfab.rhai", "token"), "");
     }
 
+    /// The whole Sketchfab plugin, the way clicking through it runs: every
+    /// line of the script executes (web replies are canned in test builds).
+    #[test]
+    fn sketchfab_end_to_end() {
+        let _turn = SKETCHFAB.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::map::{Map, Material, Object, Shape};
+        use glam::Vec3;
+        use std::io::Write;
+        let (mut host, idx) = sketchfab_host();
+        let (map, models) = (Map::default(), crate::mesh::ModelCache::default());
+        let mut statuses: Vec<String> = Vec::new();
+        let mut ev = |host: &mut crate::plugins::PluginHost, id: &str, v: &str| {
+            let out = host.panel_event(idx, &map, &models, 1.0, id, v);
+            if let Some(s) = out.status {
+                statuses.push(format!("{id}: {s}"));
+            }
+        };
+        let log_start = host.log.len();
+
+        // 1. token
+        ev(&mut host, "token_in", "  tok-abc  ");
+        ev(&mut host, "save_token", "");
+        assert_eq!(secret_get("sketchfab.rhai", "token"), "tok-abc");
+
+        // 2. search, with one complete result and one with almost nothing in it
+        let long = format!("Old Barrel: rusty / dented (game-ready) {}", "x".repeat(90));
+        mock(
+            "https://api.sketchfab.com/v3/search?type=models&downloadable=true&count=24&q=old%20barrel",
+            serde_json::json!({ "results": [
+                { "uid": "aaa111", "name": long, "user": { "displayName": "Someone" }, "license": { "label": "CC Attribution" },
+                  "viewerUrl": "https://sketchfab.com/3d-models/x-aaa111",
+                  "thumbnails": { "images": [ { "url": "https://media.sketchfab.com/t_small.jpeg", "width": 100, "height": 100 },
+                                              { "url": "https://media.sketchfab.com/t.jpeg", "width": 256, "height": 144 } ] } },
+                { "uid": "bbb222", "name": "Crate" }
+            ]}).to_string().as_bytes(),
+        );
+        ev(&mut host, "q", "old barrel");
+        ev(&mut host, "search", "");
+        let (w, _) = host.panel(idx, &map, &models, 1.0);
+        let rows: Vec<&Vec<Widget>> = w.iter().filter_map(|x| if let Widget::Row(i) = x { Some(i) } else { None }).collect();
+        let has = |id: &str| rows.iter().any(|r| r.iter().any(|i| matches!(i, Widget::Button { id: b, .. } if b == id)));
+        assert!(has("dl:aaa111") && has("dl:bbb222"), "{w:?}");
+        assert!(rows.iter().any(|r| r.iter().any(|i| matches!(i, Widget::Image { url, .. } if url == "https://media.sketchfab.com/t.jpeg"))), "picks the >=200px thumbnail");
+
+        // 3. downloads: a .glb, and a zipped .gltf with a separate .bin
+        let mut cube = Map::default();
+        cube.add(Object::brush(Shape::Box, Vec3::splat(2.0), Vec3::ZERO, [200; 3], Material::Wood));
+        let glb = crate::blender_export::scene_glb(&cube, &mut crate::mesh::ModelCache::default(), 1.0);
+        let tri: Vec<u8> = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let gltf = serde_json::json!({
+            "asset": { "version": "2.0" }, "scene": 0, "scenes": [{ "nodes": [0] }], "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [{ "attributes": { "POSITION": 0 } }] }],
+            "accessors": [{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0] }],
+            "bufferViews": [{ "buffer": 0, "byteLength": 36 }], "buffers": [{ "uri": "scene.bin", "byteLength": 36 }]
+        });
+        let mut zip = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut zip);
+            z.start_file("source/scene.gltf", zip::write::SimpleFileOptions::default()).unwrap();
+            z.write_all(gltf.to_string().as_bytes()).unwrap();
+            z.start_file("source/scene.bin", zip::write::SimpleFileOptions::default()).unwrap();
+            z.write_all(&tri).unwrap();
+            z.finish().unwrap();
+        }
+        let s3 = "https://sketchfab-prod-media.s3.amazonaws.com/archives";
+        mock("https://api.sketchfab.com/v3/models/aaa111/download", serde_json::json!({ "glb": { "url": format!("{s3}/aaa111/model.glb"), "size": glb.len() } }).to_string().as_bytes());
+        mock(&format!("{s3}/aaa111/model.glb"), &glb);
+        mock("https://api.sketchfab.com/v3/models/bbb222/download", serde_json::json!({ "gltf": { "url": format!("{s3}/bbb222/model.zip"), "size": 1 } }).to_string().as_bytes());
+        mock(&format!("{s3}/bbb222/model.zip"), zip.get_ref());
+        ev(&mut host, "dl:aaa111", "");
+        ev(&mut host, "dl:bbb222", "");
+        assert!(mock_headers("https://api.sketchfab.com/v3/models/aaa111/download").contains(&("Authorization".to_string(), "Token tok-abc".to_string())), "sends the token");
+
+        // 4. the panel finishes the jobs and imports both into the library
+        let mut imports = Vec::new();
+        let t = std::time::Instant::now();
+        while imports.len() < 2 && t.elapsed() < std::time::Duration::from_secs(10) {
+            let (_, out) = host.panel(idx, &map, &models, 1.0);
+            imports.extend(out.imports);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        assert_eq!(imports.len(), 2, "both models imported; log {:?}", &host.log[log_start..]);
+        let root = plugin_dir("sketchfab.rhai");
+        for (path, name) in &imports {
+            assert!(inside(std::path::Path::new(path), &root), "{path}");
+            crate::mesh::load_model(path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        assert!(imports.iter().any(|(p, n)| p.ends_with(".glb") && n.starts_with("Old Barrel")));
+        assert!(imports.iter().any(|(p, n)| p.ends_with("scene.gltf") && n == "Crate"));
+
+        ev(&mut host, "forget_token", "");
+
+        // 5. nothing went wrong anywhere along the way
+        let errors: Vec<&String> = host.log[log_start..].iter().filter(|l| !l.starts_with("Loaded ")).collect();
+        assert!(statuses.is_empty() && errors.is_empty(), "statuses {statuses:?}\nlog {errors:?}");
+    }
+
+    /// An OAuth token ("Bearer") works too: the "Token" try is refused, the
+    /// plugin retries with "Bearer" and the download goes through.
+    #[test]
+    fn sketchfab_bearer_token_fallback() {
+        let _turn = SKETCHFAB.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::map::{Map, Material, Object, Shape};
+        let (mut host, idx) = sketchfab_host();
+        let (map, models) = (Map::default(), crate::mesh::ModelCache::default());
+        host.panel_event(idx, &map, &models, 1.0, "token_in", "oauth-xyz");
+        host.panel_event(idx, &map, &models, 1.0, "save_token", "");
+        let mut cube = Map::default();
+        cube.add(Object::brush(Shape::Box, glam::Vec3::ONE, glam::Vec3::ZERO, [200; 3], Material::Wood));
+        let glb = crate::blender_export::scene_glb(&cube, &mut crate::mesh::ModelCache::default(), 1.0);
+        let file = "https://sketchfab-prod-media.s3.amazonaws.com/archives/ddd444/m.glb";
+        mock_auth("https://api.sketchfab.com/v3/models/ddd444/download", "Bearer oauth-xyz", serde_json::json!({ "glb": { "url": file } }).to_string().as_bytes());
+        mock(file, &glb);
+        let out = host.panel_event(idx, &map, &models, 1.0, "dl:ddd444", "");
+        assert!(out.status.is_none(), "{:?}", out.status);
+        let mut imports = Vec::new();
+        let t = std::time::Instant::now();
+        while imports.is_empty() && t.elapsed() < std::time::Duration::from_secs(10) {
+            imports.extend(host.panel(idx, &map, &models, 1.0).1.imports);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        assert_eq!(imports.len(), 1, "log {:?}", host.log);
+        crate::mesh::load_model(&imports[0].0).unwrap();
+        host.panel_event(idx, &map, &models, 1.0, "forget_token", "");
+    }
+
+    /// Your case: the plugins folder still has a released (broken) copy. It's
+    /// replaced with the fixed one on start, and loads without asking.
+    #[test]
+    fn broken_released_copy_is_replaced() {
+        let _turn = SKETCHFAB.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(old) = std::process::Command::new("git").args(["show", "v0.2.1:plugins/sketchfab.rhai"]).output() else { return };
+        if !old.status.success() {
+            return;
+        }
+        let mut host = crate::plugins::PluginHost::new();
+        let path = host.dir.join("sketchfab.rhai");
+        std::fs::write(&path, &old.stdout).unwrap();
+        host.install_builtins();
+        host.reload();
+        let now = std::fs::read(&path).unwrap();
+        let bundled = crate::plugins::BUILTIN.iter().find(|(n, _)| *n == "sketchfab.rhai").unwrap().1;
+        assert_eq!(now, bundled.as_bytes(), "the old copy was replaced");
+        assert!(host.plugins.iter().any(|p| p.file == "sketchfab.rhai"), "and it loads");
+        assert!(host.pending.iter().all(|p| p.file != "sketchfab.rhai"), "without an approval prompt");
+    }
+
+    /// Every bundled plugin from every released version (git tags) is either
+    /// the current one or on the upgrade list, so nobody is left with an old
+    /// broken copy. Skips when git or the tags aren't available.
+    #[test]
+    fn released_plugins_all_upgrade() {
+        let Ok(out) = std::process::Command::new("git").args(["tag", "-l", "v*"]).output() else { return };
+        let tags: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let mut checked = 0;
+        for tag in &tags {
+            for (name, src) in crate::plugins::BUILTIN {
+                let Ok(o) = std::process::Command::new("git").args(["show", &format!("{tag}:plugins/{name}")]).output() else { continue };
+                if !o.status.success() {
+                    continue;
+                }
+                let h = crate::plugins::fnv(&o.stdout);
+                let current = o.stdout == src.as_bytes();
+                let listed = crate::plugins::OLD_BUILTINS.iter().any(|(n, x)| *n == name && *x == h);
+                assert!(current || listed, "{tag} shipped a different {name} (fnv {h:#018x}); add it to OLD_BUILTINS");
+                checked += 1;
+            }
+        }
+        println!("checked {checked} released plugin files from {} tag(s)", tags.len());
+    }
+
     #[test]
     #[ignore] // talks to sketchfab.com
     fn sketchfab_search_live() {
-        let mut host = crate::plugins::PluginHost::new();
-        let idx = host.plugins.iter().position(|p| p.file == "sketchfab.rhai").unwrap();
+        let (mut host, idx) = sketchfab_host();
         let (map, models) = (crate::map::Map::default(), crate::mesh::ModelCache::default());
         host.panel_event(idx, &map, &models, 1.0, "q", "barrel");
         host.panel_event(idx, &map, &models, 1.0, "search", "");

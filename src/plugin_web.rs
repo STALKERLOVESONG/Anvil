@@ -36,6 +36,38 @@ pub fn url_allowed(url: &str, hosts: &[String]) -> bool {
     https_host(url).is_some_and(|h| hosts.iter().any(|a| a.eq_ignore_ascii_case(&h)))
 }
 
+/// Test builds only: canned responses per URL (plus the headers each URL got).
+#[cfg(test)]
+static MOCK: Mutex<Option<HashMap<String, Vec<(Option<String>, Vec<u8>)>>>> = Mutex::new(None);
+#[cfg(test)]
+static MOCK_SEEN: Mutex<Option<HashMap<String, Vec<(String, String)>>>> = Mutex::new(None);
+
+#[cfg(test)]
+pub fn mock(url: &str, body: &[u8]) {
+    MOCK.lock().unwrap().get_or_insert_with(HashMap::new).entry(url.to_string()).or_default().push((None, body.to_vec()));
+}
+
+/// Answers only requests carrying this exact Authorization header.
+#[cfg(test)]
+pub fn mock_auth(url: &str, auth: &str, body: &[u8]) {
+    MOCK.lock().unwrap().get_or_insert_with(HashMap::new).entry(url.to_string()).or_default().push((Some(auth.to_string()), body.to_vec()));
+}
+
+#[cfg(test)]
+pub fn mock_headers(url: &str) -> Vec<(String, String)> {
+    MOCK_SEEN.lock().unwrap().as_ref().and_then(|m| m.get(url).cloned()).unwrap_or_default()
+}
+
+/// None = not mocked; Some(Err) = mocked but refused (wrong Authorization).
+#[cfg(test)]
+fn mocked(url: &str, headers: &[(String, String)]) -> Option<Result<Vec<u8>, String>> {
+    let entries = MOCK.lock().ok()?.as_ref()?.get(url).cloned()?;
+    MOCK_SEEN.lock().unwrap().get_or_insert_with(HashMap::new).insert(url.to_string(), headers.to_vec());
+    let auth = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.clone());
+    let hit = entries.iter().find(|(a, _)| a.is_none() || *a == auth).map(|(_, b)| b.clone());
+    Some(hit.ok_or_else(|| "status code 401".to_string()))
+}
+
 fn request(url: &str, headers: &[(String, String)], hosts: &[String]) -> Result<ureq::Response, String> {
     if !url_allowed(url, hosts) {
         return Err(format!("Not allowed: {url} isn't https to one of this plugin's hosts"));
@@ -52,6 +84,12 @@ fn request(url: &str, headers: &[(String, String)], hosts: &[String]) -> Result<
 }
 
 pub fn http_get(url: &str, headers: &[(String, String)], hosts: &[String]) -> Result<String, String> {
+    #[cfg(test)]
+    if url_allowed(url, hosts) {
+        if let Some(r) = mocked(url, headers) {
+            return r.map(|b| String::from_utf8_lossy(&b).into_owned());
+        }
+    }
     let resp = request(url, headers, hosts)?;
     let mut s = String::new();
     resp.into_reader().take(MAX_TEXT).read_to_string(&mut s).map_err(|e| e.to_string())?;
@@ -75,10 +113,22 @@ fn set_job(id: i64, f: impl FnOnce(&mut Job)) {
     }
 }
 
+/// A safe file name: plain characters only, no leading dot, the stem cut to
+/// 60 characters but the extension always kept.
 pub fn safe_name(name: &str) -> String {
-    let n: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).take(80).collect();
-    let n = n.trim_start_matches('.').to_string();
-    if n.is_empty() { "download".into() } else { n }
+    let clean = |s: &str, max: usize| -> String { s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).take(max).collect() };
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !e.is_empty() && e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric()) => (s, Some(e)),
+        _ => (name, None),
+    };
+    let mut stem = clean(stem, 60);
+    if stem.trim_matches('_').is_empty() {
+        stem = "download".into();
+    }
+    match ext {
+        Some(e) => format!("{stem}.{}", e.to_ascii_lowercase()),
+        None => stem,
+    }
 }
 
 /// Starts a background download into `dir`. Returns a job id.
@@ -92,6 +142,12 @@ pub fn start_download(url: String, name: &str, headers: Vec<(String, String)>, h
     std::thread::spawn(move || {
         let r = (|| -> Result<(), String> {
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            #[cfg(test)]
+            if url_allowed(&url, &hosts) {
+                if let Some(r) = mocked(&url, &headers) {
+                    return std::fs::write(&path, r?).map_err(|e| e.to_string());
+                }
+            }
             let resp = request(&url, &headers, &hosts)?;
             let total = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
             set_job(id, |j| j.total = total);

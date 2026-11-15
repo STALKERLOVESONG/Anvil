@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.2
+
+- **Fixed:** clicking *Download* in the Sketchfab window failed with "Function not found:
+  is_alphanumeric".
+- **Fixed:** long model names no longer lose their file extension when downloaded.
+- **Sign-in:** downloads work with a personal API token or an OAuth token. Sketchfab's
+  download docs only show OAuth, so the plugin tries both.
+- **Upgrade:** a broken copy of the plugin from 0.2.0 or 0.2.1 is replaced automatically
+  when 0.2.2 starts.
+- **Tests:**
+  - The whole Sketchfab flow (token, search, .glb and zipped glTF downloads, unzip,
+    import) is now tested end to end.
+  - A new test makes sure every released plugin version gets upgraded.
+
 ## 0.2.1
 
 - **Fixed:** saving your Sketchfab API token failed with
