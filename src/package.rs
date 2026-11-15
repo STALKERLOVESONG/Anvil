@@ -30,6 +30,102 @@ fn line_path(rest: &str) -> String {
     rest.split_whitespace().last().unwrap_or("").to_string()
 }
 
+/// A model with the files it needs, flattened into one folder: the model
+/// itself (an OBJ is rewritten to point at the flat names), its .mtl files
+/// and their textures. `allow` decides which referenced files may be read.
+pub struct ModelBundle {
+    pub model: Vec<u8>,
+    /// (flat file name, contents)
+    pub files: Vec<(String, Vec<u8>)>,
+    pub missing: Vec<String>,
+    /// File extension to save `model` with (a .glb comes out as a .gltf).
+    pub ext: String,
+}
+
+/// `model`'s file name with the extension a bundle saves it under.
+pub fn bundled_name(model: &str, ext: &str) -> String {
+    let name = file_name(model);
+    let stem = name.rsplit_once('.').map(|x| x.0).unwrap_or(&name);
+    format!("{stem}.{ext}")
+}
+
+/// Flat, safe file name for a referenced file (hash of the full path + its name).
+pub fn flat_name(full: &Path) -> String {
+    let name = file_name(&full.to_string_lossy());
+    let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect();
+    format!("{:08x}_{}", fnv(&full.to_string_lossy()) as u32, clean.trim_start_matches('.'))
+}
+
+pub fn model_bundle(model: &str, bytes: &[u8], allow: &dyn Fn(&Path) -> bool) -> ModelBundle {
+    let lower = model.to_ascii_lowercase();
+    let ext = lower.rsplit_once('.').map(|x| x.1.to_string()).unwrap_or_default();
+    let mut out = ModelBundle { model: bytes.to_vec(), files: Vec::new(), missing: Vec::new(), ext };
+    if lower.ends_with(".glb") || lower.ends_with(".gltf") {
+        // a .gltf's .bin and textures (and a .glb's embedded ones) as flat files;
+        // if it can't be read, the file goes as it is
+        if let Ok((json, files)) = crate::gltf::bundle(model, allow, None) {
+            out.model = json;
+            out.files = files;
+            out.ext = "gltf".into();
+        } else if lower.ends_with(".gltf") {
+            out.missing.push(format!("{model} (its .bin or textures)"));
+        }
+        return out;
+    }
+    if !lower.ends_with(".obj") {
+        return out;
+    }
+    let src_dir = Path::new(model).parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    let text = String::from_utf8_lossy(bytes);
+    let mut new_obj = String::with_capacity(text.len());
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("mtllib ") else {
+            new_obj.push_str(line);
+            new_obj.push('\n');
+            continue;
+        };
+        let mut names = Vec::new();
+        for mtl in rest.split_whitespace() {
+            let mtl_src = src_dir.join(mtl);
+            let text = (allow(&mtl_src) && mtl.to_ascii_lowercase().ends_with(".mtl")).then(|| std::fs::read_to_string(&mtl_src).ok()).flatten();
+            let Some(mtl_text) = text else {
+                out.missing.push(mtl_src.to_string_lossy().to_string());
+                continue;
+            };
+            let mtl_dir = mtl_src.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+            let mut new_mtl = String::new();
+            for l in mtl_text.lines() {
+                let t = l.trim_start();
+                let key = t.split_whitespace().next().unwrap_or("");
+                if key.starts_with("map_") || key == "bump" || key == "norm" || key == "disp" || key == "decal" {
+                    let p = line_path(&t[key.len()..]);
+                    let full = if Path::new(&p).is_absolute() { PathBuf::from(&p) } else { mtl_dir.join(&p) };
+                    let read = allow(&full).then(|| std::fs::read(&full).ok()).flatten();
+                    match read {
+                        Some(b) => {
+                            let fname = flat_name(&full);
+                            if !out.files.iter().any(|f| f.0 == fname) {
+                                out.files.push((fname.clone(), b));
+                            }
+                            new_mtl.push_str(&format!("{key} {fname}\n"));
+                        }
+                        None => out.missing.push(full.to_string_lossy().to_string()),
+                    }
+                } else {
+                    new_mtl.push_str(l);
+                    new_mtl.push('\n');
+                }
+            }
+            let mname = flat_name(&mtl_src);
+            out.files.push((mname.clone(), new_mtl.into_bytes()));
+            names.push(mname);
+        }
+        new_obj.push_str(&format!("mtllib {}\n", names.join(" ")));
+    }
+    out.model = new_obj.into_bytes();
+    out
+}
+
 pub fn save_package(map: &Map, settings: &Settings, path: &Path) -> Result<String, String> {
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut done: HashMap<String, String> = HashMap::new();
@@ -84,56 +180,14 @@ pub fn save_package(map: &Map, settings: &Settings, path: &Path) -> Result<Strin
             continue;
         };
         let folder = format!("assets/models/{:08x}", fnv(model) as u32);
-        let src_dir = Path::new(model).parent().map(|d| d.to_path_buf()).unwrap_or_default();
-        let is_obj = model.to_ascii_lowercase().ends_with(".obj");
-        if is_obj {
-            let text = String::from_utf8_lossy(&bytes);
-            let mut new_obj = String::with_capacity(text.len());
-            for line in text.lines() {
-                if let Some(rest) = line.trim_start().strip_prefix("mtllib ") {
-                    let mut names = Vec::new();
-                    for mtl in rest.split_whitespace() {
-                        let mtl_src = src_dir.join(mtl);
-                        let Ok(mtl_text) = std::fs::read_to_string(&mtl_src) else {
-                            missing.push(mtl_src.to_string_lossy().to_string());
-                            continue;
-                        };
-                        let mtl_dir = mtl_src.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-                        let mut new_mtl = String::new();
-                        for l in mtl_text.lines() {
-                            let t = l.trim_start();
-                            let key = t.split_whitespace().next().unwrap_or("");
-                            if key.starts_with("map_") || key == "bump" || key == "norm" || key == "disp" || key == "decal" {
-                                let p = line_path(&t[key.len()..]);
-                                let full = if Path::new(&p).is_absolute() { PathBuf::from(&p) } else { mtl_dir.join(&p) };
-                                match std::fs::read(&full) {
-                                    Ok(b) => {
-                                        let fname = format!("{:08x}_{}", fnv(&full.to_string_lossy()) as u32, file_name(&p));
-                                        files.push((format!("{folder}/{fname}"), b));
-                                        new_mtl.push_str(&format!("{key} {fname}\n"));
-                                    }
-                                    Err(_) => missing.push(full.to_string_lossy().to_string()),
-                                }
-                            } else {
-                                new_mtl.push_str(l);
-                                new_mtl.push('\n');
-                            }
-                        }
-                        let mname = file_name(mtl);
-                        files.push((format!("{folder}/{mname}"), new_mtl.into_bytes()));
-                        names.push(mname);
-                    }
-                    new_obj.push_str(&format!("mtllib {}\n", names.join(" ")));
-                } else {
-                    new_obj.push_str(line);
-                    new_obj.push('\n');
-                }
-            }
-            files.push((format!("{folder}/{}", file_name(model)), new_obj.into_bytes()));
-        } else {
-            files.push((format!("{folder}/{}", file_name(model)), bytes));
+        let b = model_bundle(model, &bytes, &|_| true);
+        missing.extend(b.missing);
+        for (name, data) in b.files {
+            files.push((format!("{folder}/{name}"), data));
         }
-        model_map.insert(model.clone(), format!("{folder}/{}", file_name(model)));
+        let name = bundled_name(model, &b.ext);
+        files.push((format!("{folder}/{name}"), b.model));
+        model_map.insert(model.clone(), format!("{folder}/{name}"));
     }
     for o in &mut out_map.objects {
         if let Kind::Prop { model, .. } = &mut o.kind {

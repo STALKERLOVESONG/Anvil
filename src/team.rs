@@ -35,7 +35,7 @@ const HELLO_LIMIT: usize = 64 * 1024;
 const MSG_LIMIT: usize = 48 * 1024 * 1024;
 const WELCOME_LIMIT: usize = 512 * 1024 * 1024;
 pub const ASSET_LIMIT: u64 = 24 * 1024 * 1024;
-pub const ASSET_EXTS: [&str; 8] = ["png", "jpg", "jpeg", "bmp", "tga", "obj", "stl", "glb"];
+pub const ASSET_EXTS: [&str; 9] = ["png", "jpg", "jpeg", "bmp", "tga", "obj", "stl", "glb", "gltf"];
 const TICK: Duration = Duration::from_millis(100);
 const MAX_ASKS: usize = 4;
 const MAX_HANDSHAKES: usize = 32;
@@ -70,7 +70,14 @@ pub enum Msg {
     Meta { from: u32, seq: u64, name: String, folders: Vec<Folder>, textures: Vec<TextureDef> },
     Ack { seq: u64 },
     AssetReq { path: String },
-    AssetData { path: String, data: String },
+    /// A file the map uses. For an .obj, `extra` carries its .mtl files and
+    /// textures as (flat file name, base64) so props arrive textured.
+    AssetData {
+        path: String,
+        data: String,
+        #[serde(default)]
+        extra: Vec<(String, String)>,
+    },
     AssetMissing { path: String },
     Bye { reason: String },
 }
@@ -224,6 +231,91 @@ pub fn sandbox_name(remote: &str) -> Option<String> {
     let stem = base.rsplit_once('.').map(|x| x.0).unwrap_or(base);
     let stem: String = stem.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').take(40).collect();
     Some(format!("{:016x}_{}.{ext}", fnv(remote.as_bytes()), if stem.is_empty() { "file" } else { &stem }))
+}
+
+const BUNDLE_LIMIT: u64 = 32 * 1024 * 1024;
+const MAX_BUNDLE_FILES: usize = 64;
+const BUNDLE_EXTS: [&str; 6] = ["mtl", "png", "jpg", "jpeg", "bmp", "tga"];
+/// What a glTF bundle holds: one .bin and its textures (always png / jpg).
+const GLTF_BUNDLE_EXTS: [&str; 3] = ["bin", "png", "jpg"];
+/// Biggest .glb / .gltf (or .bin) read to send: it's repacked and its
+/// textures shrunk until it fits the transfer limits.
+const GLTF_SOURCE_LIMIT: u64 = 512 * 1024 * 1024;
+
+fn is_gltf(p: &str) -> bool {
+    matches!(path_ext(p).as_str(), "gltf" | "glb")
+}
+
+/// Files that may travel with this kind of model.
+fn bundle_exts(model: &str) -> &'static [&'static str] {
+    if is_gltf(model) {
+        &GLTF_BUNDLE_EXTS
+    } else {
+        &BUNDLE_EXTS
+    }
+}
+
+/// May this file go out with a shared model? Only .mtl and images (an .obj)
+/// or .bin and images (a glTF), small enough, not on a network share, and
+/// only from the model's own folder area (its folder's parent), Anvil's
+/// content folder (Half-Life imports), the Team Create cache or opened
+/// packages. Even an odd model can't be used to send anything else.
+pub fn bundle_allowed(obj: &Path, dep: &Path, cache: &Path) -> bool {
+    let ds = dep.to_string_lossy();
+    let model = obj.to_string_lossy();
+    let exts: &[&str] = if is_gltf(&model) { &["bin", "png", "jpg", "jpeg"] } else { &BUNDLE_EXTS };
+    if !exts.contains(&path_ext(&ds).as_str()) || crate::texture::is_network_path(&ds) {
+        return false;
+    }
+    let limit = if is_gltf(&model) { GLTF_SOURCE_LIMIT } else { ASSET_LIMIT };
+    if !std::fs::metadata(dep).is_ok_and(|m| m.is_file() && m.len() <= limit) {
+        return false;
+    }
+    let Ok(d) = dep.canonicalize() else { return false };
+    let roots = [obj.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()), Some(crate::mount::content_dir()), Some(cache.to_path_buf()), Some(crate::package::packages_dir())];
+    roots.into_iter().flatten().filter_map(|r| r.canonicalize().ok()).any(|r| d.starts_with(r))
+}
+
+/// Checks a received model bundle for `model`: plain file names only (no
+/// folders, no dots in front), the types that model kind may bring, size
+/// limits, images that really are images. Returns decoded files.
+pub fn check_bundle(model: &str, extra: &[(String, String)]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let exts = bundle_exts(model);
+    if extra.len() > MAX_BUNDLE_FILES {
+        return Err("too many files with the model".into());
+    }
+    let mut total = 0u64;
+    let mut out = Vec::new();
+    for (name, b64) in extra {
+        let ok_name = !name.is_empty() && name.len() <= 120 && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
+        if !ok_name || !exts.contains(&path_ext(name).as_str()) {
+            return Err(format!("unsafe file name with the model: {name}"));
+        }
+        if out.iter().any(|(n, _): &(String, Vec<u8>)| n.eq_ignore_ascii_case(name)) {
+            return Err(format!("{name} sent twice"));
+        }
+        let bytes = b64_decode(b64).ok_or("damaged data")?;
+        total += bytes.len() as u64;
+        if bytes.len() as u64 > ASSET_LIMIT || total > BUNDLE_LIMIT {
+            return Err("the model's textures are too big".into());
+        }
+        if !matches!(path_ext(name).as_str(), "mtl" | "tga" | "bin") && image::guess_format(&bytes).is_err() {
+            return Err(format!("{name} isn't really an image"));
+        }
+        out.push((name.clone(), bytes));
+    }
+    Ok(out)
+}
+
+/// A received .gltf may only point at files that came with it.
+pub fn check_gltf(gltf: &[u8], files: &[(String, Vec<u8>)]) -> Result<(), String> {
+    let json: serde_json::Value = serde_json::from_slice(gltf).map_err(|_| "not a glTF model")?;
+    for r in crate::gltf::referenced_files(&json) {
+        if !files.iter().any(|(n, _)| *n == r) {
+            return Err(format!("the model points at a file that wasn't sent with it: {r}"));
+        }
+    }
+    Ok(())
 }
 
 /// Every file path the map points at.
@@ -1007,11 +1099,11 @@ impl Session {
                 }
             }
             Msg::AssetReq { path } => self.serve(conn, path, map),
-            Msg::AssetData { path, data } => {
+            Msg::AssetData { path, data, extra } => {
                 if !self.asked.remove(&path) {
                     return; // never asked for it
                 }
-                match self.store_asset(&path, &data) {
+                match self.store_asset(&path, &data, &extra) {
                     Ok(local) => {
                         self.remap.insert(path.clone(), local.clone());
                         out.assets.push((path.clone(), local.clone()));
@@ -1078,23 +1170,93 @@ impl Session {
 
     fn send_file(&mut self, conn: u32, key: &str, file: &Path) {
         let ok_ext = ASSET_EXTS.contains(&path_ext(key).as_str()) && ASSET_EXTS.contains(&path_ext(&file.to_string_lossy()).as_str());
+        if ok_ext && is_gltf(key) && is_gltf(&file.to_string_lossy()) {
+            let msg = self.gltf_msg(key, file);
+            self.send_to(conn, &line(&msg));
+            return;
+        }
         let data = (ok_ext && !crate::texture::is_network_path(&file.to_string_lossy()))
             .then(|| std::fs::metadata(file).ok())
             .flatten()
             .filter(|m| m.is_file() && m.len() <= ASSET_LIMIT)
             .and_then(|_| std::fs::read(file).ok());
         let msg = match data {
-            Some(d) => Msg::AssetData { path: key.to_string(), data: b64_encode(&d) },
+            Some(d) if path_ext(key) == "obj" => {
+                let cache = self.cache_dir.clone();
+                let b = crate::package::model_bundle(&file.to_string_lossy(), &d, &|dep| bundle_allowed(file, dep, &cache));
+                let total: u64 = b.files.iter().map(|f| f.1.len() as u64).sum::<u64>() + b.model.len() as u64;
+                if total <= BUNDLE_LIMIT && b.files.len() <= MAX_BUNDLE_FILES {
+                    Msg::AssetData { path: key.to_string(), data: b64_encode(&b.model), extra: b.files.iter().map(|(n, d)| (n.clone(), b64_encode(d))).collect() }
+                } else {
+                    self.log.push(format!("{}: its textures are too big to send, sending the shape only", key.rsplit(['/', '\\']).next().unwrap_or(key)));
+                    Msg::AssetData { path: key.to_string(), data: b64_encode(&d), extra: Vec::new() }
+                }
+            }
+            Some(d) => Msg::AssetData { path: key.to_string(), data: b64_encode(&d), extra: Vec::new() },
             None => Msg::AssetMissing { path: key.to_string() },
         };
         self.send_to(conn, &line(&msg));
     }
 
-    fn store_asset(&self, path: &str, data: &str) -> Result<PathBuf, String> {
+    /// A .glb / .gltf (e.g. from Sketchfab) goes as a .gltf + .bin + textures.
+    /// Big textures are shrunk step by step until it fits the transfer limit.
+    fn gltf_msg(&mut self, key: &str, file: &Path) -> Msg {
+        let short = key.rsplit(['/', '\\']).next().unwrap_or(key).to_string();
+        let fs = file.to_string_lossy().to_string();
+        let ok = !crate::texture::is_network_path(&fs) && std::fs::metadata(file).is_ok_and(|m| m.is_file() && m.len() <= GLTF_SOURCE_LIMIT);
+        if !ok {
+            return Msg::AssetMissing { path: key.to_string() };
+        }
+        let cache = self.cache_dir.clone();
+        let allow = |dep: &Path| bundle_allowed(file, dep, &cache);
+        for max in [None, Some(2048), Some(1024), Some(512), Some(256)] {
+            let (json, files) = match crate::gltf::bundle(&fs, &allow, max) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.log.push(format!("{short} can't be sent: {e}"));
+                    return Msg::AssetMissing { path: key.to_string() };
+                }
+            };
+            let total: u64 = files.iter().map(|f| f.1.len() as u64).sum::<u64>() + json.len() as u64;
+            let fits = json.len() as u64 <= ASSET_LIMIT && files.iter().all(|f| f.1.len() as u64 <= ASSET_LIMIT) && total <= BUNDLE_LIMIT && files.len() <= MAX_BUNDLE_FILES;
+            if fits {
+                if let Some(m) = max {
+                    self.log.push(format!("{short}: textures shrunk to {m} px so it fits through Team Create"));
+                }
+                return Msg::AssetData { path: key.to_string(), data: b64_encode(&json), extra: files.iter().map(|(n, d)| (n.clone(), b64_encode(d))).collect() };
+            }
+        }
+        self.log.push(format!("{short} is too big to send (its mesh alone is over {} MB)", BUNDLE_LIMIT / 1024 / 1024));
+        Msg::AssetMissing { path: key.to_string() }
+    }
+
+    fn store_asset(&self, path: &str, data: &str, extra: &[(String, String)]) -> Result<PathBuf, String> {
         if data.len() as u64 > ASSET_LIMIT * 4 / 3 + 8 {
             return Err("too large".into());
         }
         let name = sandbox_name(path).ok_or("file type not allowed")?;
+        if is_gltf(path) {
+            return self.store_gltf(path, &name, data, extra);
+        }
+        if !extra.is_empty() {
+            if path_ext(path) != "obj" {
+                return Err("only .obj and glTF models come with extra files".into());
+            }
+            let files = check_bundle(path, extra)?;
+            // each model gets its own folder, so its .mtl / texture names can't clash
+            let dir = self.cache_dir.join(format!("model_{:016x}", fnv(path.as_bytes())));
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            for (n, bytes) in files {
+                std::fs::write(dir.join(n), bytes).map_err(|e| e.to_string())?;
+            }
+            let bytes = b64_decode(data).ok_or("damaged data")?;
+            if bytes.len() as u64 > ASSET_LIMIT {
+                return Err("too large".into());
+            }
+            let out = dir.join(name);
+            std::fs::write(&out, bytes).map_err(|e| e.to_string())?;
+            return Ok(out);
+        }
         let bytes = b64_decode(data).ok_or("damaged data")?;
         if bytes.len() as u64 > ASSET_LIMIT {
             return Err("too large".into());
@@ -1104,6 +1266,34 @@ impl Session {
         }
         std::fs::create_dir_all(&self.cache_dir).map_err(|e| e.to_string())?;
         let out = self.cache_dir.join(name);
+        std::fs::write(&out, bytes).map_err(|e| e.to_string())?;
+        Ok(out)
+    }
+
+    /// A received glTF: either a plain .glb (older Anvil) or a .gltf whose
+    /// every outside file is one of the checked files sent with it.
+    fn store_gltf(&self, path: &str, name: &str, data: &str, extra: &[(String, String)]) -> Result<PathBuf, String> {
+        let bytes = b64_decode(data).ok_or("damaged data")?;
+        if bytes.len() as u64 > ASSET_LIMIT {
+            return Err("too large".into());
+        }
+        let dir = self.cache_dir.join(format!("model_{:016x}", fnv(path.as_bytes())));
+        let stem = name.rsplit_once('.').map(|x| x.0).unwrap_or(name);
+        let (out_name, files) = if bytes.starts_with(b"glTF") {
+            if !extra.is_empty() {
+                return Err("a .glb doesn't come with extra files".into());
+            }
+            (format!("{stem}.glb"), Vec::new())
+        } else {
+            let files = check_bundle(path, extra)?;
+            check_gltf(&bytes, &files)?;
+            (format!("{stem}.gltf"), files)
+        };
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        for (n, b) in files {
+            std::fs::write(dir.join(n), b).map_err(|e| e.to_string())?;
+        }
+        let out = dir.join(out_name);
         std::fs::write(&out, bytes).map_err(|e| e.to_string())?;
         Ok(out)
     }

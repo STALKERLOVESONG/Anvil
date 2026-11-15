@@ -68,11 +68,16 @@ fn mocked(url: &str, headers: &[(String, String)]) -> Option<Result<Vec<u8>, Str
     Some(hit.ok_or_else(|| "status code 401".to_string()))
 }
 
-fn request(url: &str, headers: &[(String, String)], hosts: &[String]) -> Result<ureq::Response, String> {
+/// `download`: a big file. Instead of 30 s for the whole request it may take
+/// as long as it needs, as long as data keeps coming (gives up after a
+/// minute with nothing).
+fn request(url: &str, headers: &[(String, String)], hosts: &[String], download: bool) -> Result<ureq::Response, String> {
     if !url_allowed(url, hosts) {
         return Err(format!("Not allowed: {url} isn't https to one of this plugin's hosts"));
     }
-    let mut r = ureq::get(url).timeout(std::time::Duration::from_secs(30)).set("User-Agent", "Anvil-plugin");
+    let s = std::time::Duration::from_secs;
+    let agent = if download { ureq::AgentBuilder::new().timeout_connect(s(20)).timeout_read(s(60)).build() } else { ureq::AgentBuilder::new().timeout(s(30)).build() };
+    let mut r = agent.get(url).set("User-Agent", "Anvil-plugin");
     for (k, v) in headers {
         r = r.set(k, v);
     }
@@ -90,7 +95,7 @@ pub fn http_get(url: &str, headers: &[(String, String)], hosts: &[String]) -> Re
             return r.map(|b| String::from_utf8_lossy(&b).into_owned());
         }
     }
-    let resp = request(url, headers, hosts)?;
+    let resp = request(url, headers, hosts, false)?;
     let mut s = String::new();
     resp.into_reader().take(MAX_TEXT).read_to_string(&mut s).map_err(|e| e.to_string())?;
     Ok(s)
@@ -148,26 +153,12 @@ pub fn start_download(url: String, name: &str, headers: Vec<(String, String)>, h
                     return std::fs::write(&path, r?).map_err(|e| e.to_string());
                 }
             }
-            let resp = request(&url, &headers, &hosts)?;
+            let resp = request(&url, &headers, &hosts, true)?;
             let total = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
             set_job(id, |j| j.total = total);
-            let mut rd = resp.into_reader().take(MAX_DOWNLOAD + 1);
-            let mut f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
-            let mut buf = vec![0u8; 256 * 1024];
-            let mut got = 0u64;
-            loop {
-                let n = rd.read(&mut buf).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    break;
-                }
-                got += n as u64;
-                if got > MAX_DOWNLOAD {
-                    return Err("download is over 1 GB".into());
-                }
-                std::io::Write::write_all(&mut f, &buf[..n]).map_err(|e| e.to_string())?;
-                set_job(id, |j| j.got = got);
-            }
-            Ok(())
+            // a compressed body's length isn't the length that comes out
+            let plain = resp.header("Content-Encoding").is_none_or(|e| e.eq_ignore_ascii_case("identity"));
+            save_body(resp.into_reader(), if plain { total } else { 0 }, &path, &|got| set_job(id, |j| j.got = got))
         })();
         set_job(id, |j| {
             j.state = match r {
@@ -177,6 +168,44 @@ pub fn start_download(url: String, name: &str, headers: Vec<(String, String)>, h
         });
     });
     id
+}
+
+/// Writes a download to `path` through a `.part` file, so a download that
+/// stops halfway (connection dropped, Anvil closed) never looks finished.
+/// `total` (Content-Length, 0 = unknown) must match what arrived.
+pub fn save_body(rd: impl Read, total: u64, path: &Path, progress: &dyn Fn(u64)) -> Result<(), String> {
+    let part = path.with_extension(format!("{}.part", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
+    let r = (|| -> Result<(), String> {
+        let mut rd = rd.take(MAX_DOWNLOAD + 1);
+        let mut f = std::fs::File::create(&part).map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut got = 0u64;
+        loop {
+            let n = match rd.read(&mut buf) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("download stopped: {e}")),
+            };
+            if n == 0 {
+                break;
+            }
+            got += n as u64;
+            if got > MAX_DOWNLOAD {
+                return Err("download is over 1 GB".into());
+            }
+            std::io::Write::write_all(&mut f, &buf[..n]).map_err(|e| e.to_string())?;
+            progress(got);
+        }
+        if total > 0 && got != total {
+            return Err(format!("download was cut off ({} of {} MB), try again", got / 1_000_000, total.div_ceil(1_000_000)));
+        }
+        drop(f);
+        std::fs::rename(&part, path).map_err(|e| e.to_string())
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    r
 }
 
 /// (state, file path, progress 0..1)

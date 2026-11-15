@@ -346,7 +346,9 @@ Edit one map together, live, like Roblox Team Create.
   - Other people float in the views as colored balls with their name and tool.
   - Whatever they have selected is outlined in their color.
   - Undo only undoes your own changes.
-- **Textures and models:** the files the map uses are copied over automatically.
+- **Textures and models:** the files the map uses are copied over automatically, including
+  each prop's `.mtl` and texture images (or a glTF / Sketchfab model's `.bin` and textures). So props (Half-Life imports too) show up textured
+  for everyone, even if only one of you has the game.
 
 **Safety**
 - **Your IP address:**
@@ -452,6 +454,19 @@ Then:
 - **Import scale**: default 0.07, so a 72-unit HL2 character is about 5 studs. Set it in the Content window.
 
 Supported: VPK v1/v2, GMA v1-3, VTF 7.0-7.5 (DXT1/3/5 and the common uncompressed formats), and MDL v44-49 (Half-Life 2 / GMod / Source SDK 2013).
+
+
+**No game on this PC?** Mount a game folder from another PC on your home network instead of
+installing it.
+
+1. On the PC with the game, share its game folder in Windows (right-click the folder →
+   Properties → Sharing). For example `...\steamapps\common\GarrysMod`, read-only.
+2. Here, in the Half-Life window, click *Add folder…*, open **Network → that PC** and pick
+   the shared folder.
+3. Browse its props and materials as if they were local.
+
+Only the props and textures you import are copied to this PC, so it barely uses any space.
+The other PC has to be on while you browse.
 
 ## Export
 

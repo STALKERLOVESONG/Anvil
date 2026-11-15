@@ -285,3 +285,120 @@ pub fn load(path: &str) -> Result<TriMesh, String> {
     }
     Ok(m)
 }
+
+fn fnv(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+}
+
+/// An image as a png / jpg file, shrunk to fit `max_tex` (if given).
+/// Other formats are converted; anything that can't be read is dropped.
+fn portable_image(bytes: &[u8], max_tex: Option<u32>) -> Option<(Vec<u8>, &'static str)> {
+    let fmt = image::guess_format(bytes).ok()?;
+    let ext = match fmt {
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Jpeg => "jpg",
+        _ => "",
+    };
+    if !ext.is_empty() && max_tex.is_none() {
+        return Some((bytes.to_vec(), ext));
+    }
+    let mut r = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    r.limits(crate::texture::image_limits());
+    let img = r.decode().ok()?;
+    let m = max_tex.unwrap_or(16384);
+    if !ext.is_empty() && img.width() <= m && img.height() <= m {
+        return Some((bytes.to_vec(), ext));
+    }
+    let img = if img.width() > m || img.height() > m { img.resize(m, m, image::imageops::FilterType::Triangle) } else { img };
+    let mut out = Vec::new();
+    if fmt != image::ImageFormat::Jpeg && img.color().has_alpha() {
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
+        Some((out, "png"))
+    } else {
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90).encode_image(&img.to_rgb8()).ok()?;
+        Some((out, "jpg"))
+    }
+}
+
+/// A .glb / .gltf made portable, to send to Team Create friends or pack:
+/// one .gltf (JSON) plus a single .bin and its textures as separate png / jpg
+/// files, all with flat names (no folders). Textures bigger than `max_tex`
+/// are shrunk. Every outside file it reads must pass `allow`.
+/// Returns (gltf JSON, [(file name, contents)]).
+pub fn bundle(path: &str, allow: &dyn Fn(&Path) -> bool, max_tex: Option<u32>) -> Result<(Vec<u8>, Vec<(String, Vec<u8>)>), String> {
+    let g = Gltf::open(path)?;
+    for b in g.json["buffers"].as_array().into_iter().flatten() {
+        if let Some(u) = b["uri"].as_str().filter(|u| !u.starts_with("data:")) {
+            if !safe_join(&g.dir, u).is_some_and(|p| allow(&p)) {
+                return Err(format!("{u} can't be shared"));
+            }
+        }
+    }
+    let tag = format!("{:08x}", fnv(path) as u32);
+    let mut json = g.json.clone();
+    let mut files = Vec::new();
+    let mut image_views = std::collections::HashSet::new();
+    let images = g.json["images"].as_array().cloned().unwrap_or_default();
+    for (i, img) in images.iter().enumerate() {
+        let bytes = if let Some(u) = img["uri"].as_str() {
+            if u.starts_with("data:") {
+                data_uri(u)
+            } else {
+                safe_join(&g.dir, u).filter(|p| allow(p)).and_then(|p| std::fs::read(p).ok())
+            }
+        } else if let Some(bv) = img["bufferView"].as_u64() {
+            image_views.insert(bv as usize);
+            g.view(bv as usize).map(|(b, _)| b.to_vec())
+        } else {
+            None
+        };
+        json["images"][i] = match bytes.and_then(|b| portable_image(&b, max_tex)) {
+            Some((b, ext)) => {
+                let name = format!("{tag}_tex{i}.{ext}");
+                files.push((name.clone(), b));
+                serde_json::json!({ "uri": name })
+            }
+            None => serde_json::json!({}),
+        };
+    }
+    // one new buffer with every view the mesh data uses (embedded images now
+    // live in their own files, so their bytes are left out)
+    let mut used = std::collections::HashSet::new();
+    for a in g.json["accessors"].as_array().into_iter().flatten() {
+        for v in [&a["bufferView"], &a["sparse"]["indices"]["bufferView"], &a["sparse"]["values"]["bufferView"]] {
+            if let Some(v) = v.as_u64() {
+                used.insert(v as usize);
+            }
+        }
+    }
+    let mut bin: Vec<u8> = vec![0];
+    let views = g.json["bufferViews"].as_array().cloned().unwrap_or_default();
+    for i in 0..views.len() {
+        let keep = used.contains(&i) || !image_views.contains(&i);
+        match g.view(i).filter(|_| keep) {
+            Some((data, _)) => {
+                while bin.len() % 4 != 0 {
+                    bin.push(0);
+                }
+                json["bufferViews"][i]["buffer"] = 0.into();
+                json["bufferViews"][i]["byteOffset"] = bin.len().into();
+                bin.extend_from_slice(data);
+            }
+            None => json["bufferViews"][i] = serde_json::json!({ "buffer": 0, "byteOffset": 0, "byteLength": 1 }),
+        }
+    }
+    let bin_name = format!("{tag}_mesh.bin");
+    json["buffers"] = serde_json::json!([{ "uri": bin_name, "byteLength": bin.len() }]);
+    files.push((bin_name, bin));
+    Ok((serde_json::to_vec(&json).map_err(|e| e.to_string())?, files))
+}
+
+/// Every file a .gltf points at (buffer and image `uri`s that aren't data:).
+pub fn referenced_files(json: &Value) -> Vec<String> {
+    ["buffers", "images"]
+        .iter()
+        .flat_map(|k| json[*k].as_array().cloned().unwrap_or_default())
+        .filter_map(|v| v["uri"].as_str().map(|s| s.to_string()))
+        .filter(|u| !u.starts_with("data:"))
+        .collect()
+}

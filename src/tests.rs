@@ -799,6 +799,42 @@ fn package_round_trip_works_on_another_pc() {
 }
 
 #[test]
+fn packages_keep_gltf_props_whole() {
+    // a Sketchfab-style .gltf with a separate .bin and a texture in a subfolder
+    let src = out_dir("pak_gltf_src").join("model");
+    std::fs::create_dir_all(src.join("textures")).unwrap();
+    image::RgbaImage::from_fn(4, 4, |x, _| image::Rgba([x as u8 * 60, 0, 0, 255])).save(src.join("textures").join("c.png")).unwrap();
+    let mut bin: Vec<u8> = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+    bin.extend([0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0].iter().flat_map(|f| f.to_le_bytes()));
+    std::fs::write(src.join("scene.bin"), &bin).unwrap();
+    let gltf = serde_json::json!({
+        "asset": { "version": "2.0" }, "scenes": [{ "nodes": [0] }], "nodes": [{ "mesh": 0 }],
+        "meshes": [{ "primitives": [{ "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }, "material": 0 }] }],
+        "materials": [{ "pbrMetallicRoughness": { "baseColorTexture": { "index": 0 } } }],
+        "textures": [{ "source": 0 }], "images": [{ "uri": "textures/c.png" }],
+        "accessors": [
+            { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" },
+            { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2" }
+        ],
+        "bufferViews": [{ "buffer": 0, "byteLength": 36 }, { "buffer": 0, "byteOffset": 36, "byteLength": 24 }],
+        "buffers": [{ "uri": "scene.bin", "byteLength": 60 }]
+    });
+    std::fs::write(src.join("scene.gltf"), gltf.to_string()).unwrap();
+    let model = src.join("scene.gltf").to_string_lossy().to_string();
+    let mut map = Map::default();
+    map.add(Object::new(Kind::Prop { model, scale: Vec3::ONE, roblox_mesh_id: String::new() }, Vec3::ZERO, [255; 3], Material::Wood));
+    let pak = out_dir("pak_gltf").join("g.anvilpak");
+    let msg = crate::package::save_package(&map, &Settings::default(), &pak).unwrap();
+    assert!(!msg.contains("missing"), "{msg}");
+    std::fs::remove_dir_all(&src).unwrap();
+    let o = crate::package::open_package(&pak).unwrap();
+    let Kind::Prop { model, .. } = &o.map.objects[0].kind else { panic!() };
+    let mesh = crate::mesh::load_model(model).unwrap();
+    assert_eq!(mesh.tris.len(), 1);
+    assert!(std::path::Path::new(&mesh.materials[0]).is_file(), "texture packed: {:?}", mesh.materials);
+}
+
+#[test]
 fn textured_glb_embeds_images() {
     let dir = out_dir("glbtex");
     image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255])).save(dir.join("t.png")).unwrap();
@@ -1364,6 +1400,309 @@ mod team_create {
         assert_eq!(m.id_base, 0);
         let fresh = m.add(Object::brush(Shape::Box, Vec3::ONE, Vec3::ZERO, [0; 3], Material::Plastic));
         assert!(g.m.objects.iter().all(|o| o.id != fresh), "ids after the session don't collide");
+    }
+
+    #[test]
+    fn props_arrive_textured() {
+        let d = dir("props");
+        // a model pack: models/barrel.obj -> barrel.mtl -> ../textures/wood.png
+        let pack = d.join("pack");
+        std::fs::create_dir_all(pack.join("models")).unwrap();
+        std::fs::create_dir_all(pack.join("textures")).unwrap();
+        let wood = pack.join("textures").join("wood.png");
+        image::RgbaImage::from_fn(8, 8, |x, y| image::Rgba([120 + x as u8, 70 + y as u8, 30, 255])).save(&wood).unwrap();
+        // a file elsewhere the .mtl also points at: must never be sent
+        let elsewhere = d.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let secret = elsewhere.join("secret.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255])).save(&secret).unwrap();
+        std::fs::write(pack.join("models").join("barrel.mtl"), format!("newmtl wood\nKd 1 1 1\nmap_Kd ../textures/wood.png\nmap_Bump {}\n", secret.display())).unwrap();
+        std::fs::write(
+            pack.join("models").join("barrel.obj"),
+            "mtllib barrel.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nusemtl wood\nf 1/1 2/2 3/3\n",
+        )
+        .unwrap();
+        let model = pack.join("models").join("barrel.obj").to_string_lossy().to_string();
+        let mut hm = Map::default();
+        hm.add(Object::new(Kind::Prop { model: model.clone(), scale: Vec3::ONE, roblox_mesh_id: String::new() }, Vec3::ZERO, [255; 3], Material::Wood));
+        let hs = Session::host(&mut hm, "H", [1, 1, 1], 0, false, d.join("host_cache")).unwrap();
+        let addr = format!("127.0.0.1:{}", hs.port);
+        let code = hs.code.clone();
+        let mut h = P::new(hs, hm);
+        let mut g = P::new(Session::join(&addr, &code, "G", [2, 2, 2], d.join("guest_cache")).unwrap(), Map::default());
+        wait(&mut [&mut h, &mut g], "join request", |p| p[0].s.pending.len() == 1);
+        let c = h.s.pending[0].conn;
+        h.s.approve(c, &h.m);
+        wait(&mut [&mut h, &mut g], "model download", |p| p[1].got.iter().any(|r| r.assets.iter().any(|a| a.0 == model)));
+        let local = g.got.iter().flat_map(|r| r.assets.clone()).find(|a| a.0 == model).unwrap().1;
+        assert!(local.starts_with(d.join("guest_cache")), "{}", local.display());
+        let m = crate::mesh::load_model(&local.to_string_lossy()).unwrap();
+        let tex = m.materials.iter().find(|t| !t.is_empty()).expect("the prop arrives with its texture");
+        assert!(std::path::Path::new(tex).starts_with(local.parent().unwrap()), "texture sits in the model's sandbox folder: {tex}");
+        assert_eq!(std::fs::read(tex).unwrap(), std::fs::read(&wood).unwrap(), "same texture");
+        assert_eq!(m.uv.len(), m.pos.len());
+        let names: Vec<String> = std::fs::read_dir(local.parent().unwrap()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        assert!(names.iter().all(|n| !n.contains("secret")), "files outside the model's folder area aren't sent: {names:?}");
+    }
+
+    #[test]
+    fn guest_props_reach_the_host_textured() {
+        let d = dir("guest_props");
+        let pack = d.join("guestpack");
+        std::fs::create_dir_all(&pack).unwrap();
+        let tex = pack.join("crate_diffuse.png");
+        image::RgbaImage::from_fn(4, 4, |x, _| image::Rgba([x as u8 * 50, 90, 40, 255])).save(&tex).unwrap();
+        std::fs::write(pack.join("crate.mtl"), "newmtl c\nmap_Kd crate_diffuse.png\n").unwrap();
+        std::fs::write(pack.join("crate.obj"), "mtllib crate.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nusemtl c\nf 1/1 2/2 3/3\n").unwrap();
+        let model = pack.join("crate.obj").to_string_lossy().to_string();
+        let mut hm = Map::default();
+        let hs = Session::host(&mut hm, "H", [1, 1, 1], 0, false, d.join("host_cache")).unwrap();
+        let addr = format!("127.0.0.1:{}", hs.port);
+        let code = hs.code.clone();
+        let mut h = P::new(hs, hm);
+        let mut g = P::new(Session::join(&addr, &code, "G", [2, 2, 2], d.join("guest_cache")).unwrap(), Map::default());
+        wait(&mut [&mut h, &mut g], "join request", |p| p[0].s.pending.len() == 1);
+        let c = h.s.pending[0].conn;
+        h.s.approve(c, &h.m);
+        wait(&mut [&mut h, &mut g], "welcome", |p| p[1].s.welcomed);
+        // the guest places a prop from its own disk
+        g.m.add(Object::new(Kind::Prop { model: model.clone(), scale: Vec3::ONE, roblox_mesh_id: String::new() }, Vec3::ZERO, [255; 3], Material::Wood));
+        wait(&mut [&mut h, &mut g], "host gets the model", |p| p[0].got.iter().any(|r| r.assets.iter().any(|a| a.0 == model)));
+        let local = h.got.iter().flat_map(|r| r.assets.clone()).find(|a| a.0 == model).unwrap().1;
+        let m = crate::mesh::load_model(&local.to_string_lossy()).unwrap();
+        let t = m.materials.iter().find(|t| !t.is_empty()).expect("textured on the host too");
+        assert_eq!(std::fs::read(t).unwrap(), std::fs::read(&tex).unwrap());
+    }
+
+    /// A real Half-Life prop as Anvil imports it (textures two folders up,
+    /// in the content folder). Point ANVIL_REAL_CONTENT at a content folder
+    /// with models/props_interiors/computer_monitor_p1.obj to run it.
+    #[test]
+    fn real_imported_prop_arrives_textured() {
+        let Ok(src) = std::env::var("ANVIL_REAL_CONTENT") else { return };
+        let src = std::path::PathBuf::from(src);
+        let rel_obj = "models/props_interiors/computer_monitor_p1.obj";
+        if !src.join(rel_obj).is_file() {
+            return;
+        }
+        // copy it into this program's content folder, same layout as an import
+        let content = crate::mount::content_dir();
+        for rel in [rel_obj, "models/props_interiors/computer_monitor_p1.mtl", "materials/models/props_interiors/computer.png", "materials/models/props_interiors/screen.png"] {
+            let to = content.join(rel);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(src.join(rel), &to).unwrap();
+        }
+        let model = content.join(rel_obj).to_string_lossy().to_string();
+        let d = dir("real_prop");
+        let mut hm = Map::default();
+        hm.add(Object::new(Kind::Prop { model: model.clone(), scale: Vec3::ONE, roblox_mesh_id: String::new() }, Vec3::ZERO, [255; 3], Material::Plastic));
+        let hs = Session::host(&mut hm, "H", [1, 1, 1], 0, false, d.join("host_cache")).unwrap();
+        let addr = format!("127.0.0.1:{}", hs.port);
+        let code = hs.code.clone();
+        let mut h = P::new(hs, hm);
+        let mut g = P::new(Session::join(&addr, &code, "G", [2, 2, 2], d.join("guest_cache")).unwrap(), Map::default());
+        wait(&mut [&mut h, &mut g], "join request", |p| p[0].s.pending.len() == 1);
+        let c = h.s.pending[0].conn;
+        h.s.approve(c, &h.m);
+        wait(&mut [&mut h, &mut g], "model", |p| p[1].got.iter().any(|r| r.assets.iter().any(|a| a.0 == model)));
+        let local = g.got.iter().flat_map(|r| r.assets.clone()).find(|a| a.0 == model).unwrap().1;
+        let m = crate::mesh::load_model(&local.to_string_lossy()).unwrap();
+        let texs: Vec<&String> = m.materials.iter().filter(|t| !t.is_empty()).collect();
+        println!("REAL prop: {} triangles, textures {:?}", m.tris.len(), texs.iter().map(|t| std::path::Path::new(t).file_name().unwrap().to_string_lossy()).collect::<Vec<_>>());
+        assert_eq!(texs.len(), 3, "all three materials textured");
+        assert!(texs.iter().all(|t| std::path::Path::new(t).is_file()));
+        let monitor_png = std::fs::read(content.join("materials/models/props_interiors/computer.png")).unwrap();
+        assert!(texs.iter().any(|t| std::fs::read(t).unwrap() == monitor_png));
+    }
+
+    #[test]
+    fn hostile_model_bundles_are_refused() {
+        let png = {
+            let mut c = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255])).write_to(&mut c, image::ImageFormat::Png).unwrap();
+            b64_encode(c.get_ref())
+        };
+        assert!(check_bundle("m.obj", &[("ab12_wood.png".into(), png.clone()), ("m.mtl".into(), b64_encode(b"newmtl x"))]).is_ok());
+        for bad in ["../evil.png", ".hidden.png", "sub/x.png", r"sub\x.png", "x.exe", "C:x.png", ""] {
+            assert!(check_bundle("m.obj", &[(bad.to_string(), png.clone())]).is_err(), "{bad}");
+            assert!(check_bundle("m.glb", &[(bad.to_string(), png.clone())]).is_err(), "{bad}");
+        }
+        assert!(check_bundle("m.obj", &[("fake.png".into(), b64_encode(b"MZ not a picture"))]).is_err(), "not really an image");
+        let many: Vec<(String, String)> = (0..70).map(|i| (format!("t{i}.png"), png.clone())).collect();
+        assert!(check_bundle("m.obj", &many).is_err(), "too many files");
+        assert!(check_bundle("m.obj", &[("a.png".into(), png.clone()), ("A.PNG".into(), png.clone())]).is_err(), "same name twice");
+        // glTF models bring a .bin and textures, nothing else
+        assert!(check_bundle("m.glb", &[("x_mesh.bin".into(), b64_encode(&[1, 2, 3])), ("x_tex0.png".into(), png.clone())]).is_ok());
+        assert!(check_bundle("m.glb", &[("x.mtl".into(), b64_encode(b"newmtl x"))]).is_err());
+        assert!(check_bundle("m.obj", &[("x.bin".into(), b64_encode(&[1]))]).is_err());
+        // and a received .gltf may only point at those files
+        let files = vec![("x_mesh.bin".to_string(), vec![0u8; 4])];
+        assert!(check_gltf(br#"{"buffers":[{"uri":"x_mesh.bin","byteLength":4}]}"#, &files).is_ok());
+        for bad in [r#"{"buffers":[{"uri":"../../secret.bin"}]}"#, r#"{"images":[{"uri":"C:/Users/me/a.png"}]}"#, r#"{"images":[{"uri":"other.png"}]}"#, r#"{"buffers":[{"uri":"\\\\pc\\share\\a.bin"}]}"#, "MZ"] {
+            assert!(check_gltf(bad.as_bytes(), &files).is_err(), "{bad}");
+        }
+    }
+
+    /// A Sketchfab-style .gltf (separate .bin, textures in a subfolder) and a
+    /// .glb with an embedded texture both arrive textured.
+    #[test]
+    fn sketchfab_models_arrive_textured() {
+        let d = dir("gltf_props");
+        let src = d.join("downloads").join("abc_crate").join("source");
+        std::fs::create_dir_all(src.join("textures")).unwrap();
+        let tex = src.join("textures").join("crate_baseColor.png");
+        image::RgbaImage::from_fn(16, 16, |x, y| image::Rgba([x as u8 * 15, y as u8 * 15, 90, 255])).save(&tex).unwrap();
+        let mut bin: Vec<u8> = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        bin.extend([0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0].iter().flat_map(|f| f.to_le_bytes()));
+        std::fs::write(src.join("scene.bin"), &bin).unwrap();
+        let gltf = serde_json::json!({
+            "asset": { "version": "2.0" }, "scene": 0, "scenes": [{ "nodes": [0] }], "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [{ "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }, "material": 0 }] }],
+            "materials": [{ "pbrMetallicRoughness": { "baseColorTexture": { "index": 0 } } }],
+            "textures": [{ "source": 0 }], "images": [{ "uri": "textures/crate_baseColor.png" }],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0] },
+                { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2" }
+            ],
+            "bufferViews": [{ "buffer": 0, "byteLength": 36 }, { "buffer": 0, "byteOffset": 36, "byteLength": 24 }],
+            "buffers": [{ "uri": "scene.bin", "byteLength": 60 }]
+        });
+        std::fs::write(src.join("scene.gltf"), gltf.to_string()).unwrap();
+        let gltf_model = src.join("scene.gltf").to_string_lossy().to_string();
+        // a .glb with its texture inside (what Sketchfab's "glb" download is)
+        let png = d.join("t.png");
+        image::RgbaImage::from_fn(8, 8, |x, _| image::Rgba([x as u8 * 30, 200, 10, 255])).save(&png).unwrap();
+        let mut scene = Map::default();
+        let t = scene.add_texture(TextureDef::new("t".into(), png.to_string_lossy().to_string()));
+        let mut b = Object::brush(Shape::Box, Vec3::splat(2.0), Vec3::ZERO, [255; 3], Material::Plastic);
+        b.texture = Some(t);
+        scene.add(b);
+        let glb_path = d.join("downloads").join("def_barrel.glb");
+        std::fs::write(&glb_path, crate::blender_export::scene_glb(&scene, &mut crate::mesh::ModelCache::default(), 1.0)).unwrap();
+        let glb_model = glb_path.to_string_lossy().to_string();
+
+        let mut hm = Map::default();
+        for m in [&gltf_model, &glb_model] {
+            hm.add(Object::new(Kind::Prop { model: m.clone(), scale: Vec3::ONE, roblox_mesh_id: String::new() }, Vec3::ZERO, [255; 3], Material::Plastic));
+        }
+        let hs = Session::host(&mut hm, "H", [1, 1, 1], 0, false, d.join("host_cache")).unwrap();
+        let addr = format!("127.0.0.1:{}", hs.port);
+        let code = hs.code.clone();
+        let mut h = P::new(hs, hm);
+        let mut g = P::new(Session::join(&addr, &code, "G", [2, 2, 2], d.join("guest_cache")).unwrap(), Map::default());
+        wait(&mut [&mut h, &mut g], "join request", |p| p[0].s.pending.len() == 1);
+        let c = h.s.pending[0].conn;
+        h.s.approve(c, &h.m);
+        let got = |p: &P, m: &str| p.got.iter().flat_map(|r| r.assets.clone()).find(|a| a.0 == m).map(|a| a.1);
+        wait(&mut [&mut h, &mut g], "both models", |p| got(p[1], &gltf_model).is_some() && got(p[1], &glb_model).is_some());
+        for m in [&gltf_model, &glb_model] {
+            let local = got(&g, m).unwrap();
+            assert!(local.starts_with(d.join("guest_cache")), "{}", local.display());
+            let theirs = crate::mesh::load_model(m).unwrap();
+            let mine = crate::mesh::load_model(&local.to_string_lossy()).unwrap_or_else(|e| panic!("{}: {e}", local.display()));
+            assert_eq!(mine.tris.len(), theirs.tris.len(), "same shape");
+            assert_eq!(mine.uv.len(), mine.pos.len());
+            let t = mine.materials.iter().find(|t| !t.is_empty()).unwrap_or_else(|| panic!("{m} arrives textured: {:?}", mine.materials));
+            assert!(std::path::Path::new(t).is_file(), "{t}");
+            let a = image::open(t).unwrap().to_rgba8();
+            let b = image::open(theirs.materials.iter().find(|t| !t.is_empty()).unwrap()).unwrap().to_rgba8();
+            assert_eq!(a.as_raw(), b.as_raw(), "same texture pixels for {m}");
+        }
+        // only the model's own files went: one .gltf/.glb, one .bin, its textures
+        let names: Vec<String> = std::fs::read_dir(got(&g, &gltf_model).unwrap().parent().unwrap()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(h.s.log.iter().all(|l| !l.contains("can't be sent")), "{:?}", h.s.log);
+    }
+
+    /// Real Sketchfab downloads: set ANVIL_REAL_GLB to model paths split by ';'.
+    #[test]
+    fn real_sketchfab_models_arrive_textured() {
+        let Ok(list) = std::env::var("ANVIL_REAL_GLB") else { return };
+        let models: Vec<String> = list.split(';').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+        let d = dir("real_glb");
+        let mut hm = Map::default();
+        for m in &models {
+            hm.add(Object::new(Kind::Prop { model: m.clone(), scale: Vec3::ONE, roblox_mesh_id: String::new() }, Vec3::ZERO, [255; 3], Material::Plastic));
+        }
+        let hs = Session::host(&mut hm, "H", [1, 1, 1], 0, false, d.join("host_cache")).unwrap();
+        let addr = format!("127.0.0.1:{}", hs.port);
+        let code = hs.code.clone();
+        let mut h = P::new(hs, hm);
+        let mut g = P::new(Session::join(&addr, &code, "G", [2, 2, 2], d.join("guest_cache")).unwrap(), Map::default());
+        wait(&mut [&mut h, &mut g], "join request", |p| p[0].s.pending.len() == 1);
+        let c = h.s.pending[0].conn;
+        h.s.approve(c, &h.m);
+        let got = |p: &P, m: &str| p.got.iter().flat_map(|r| r.assets.clone()).find(|a| a.0 == m).map(|a| a.1);
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(60) && !models.iter().all(|m| got(&g, m).is_some()) {
+            for p in [&mut h, &mut g] {
+                let r = p.s.pump(&mut p.m, &p.pr);
+                p.got.push(r);
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        println!("after {:?}: host log {:?}\nguest log {:?}", t.elapsed(), h.s.log, g.s.log);
+        for m in &models {
+            let local = got(&g, m).unwrap_or_else(|| panic!("{m} never arrived"));
+            let theirs = crate::mesh::load_model(m).unwrap();
+            let mine = crate::mesh::load_model(&local.to_string_lossy()).unwrap();
+            let tex: Vec<&String> = mine.materials.iter().filter(|t| !t.is_empty()).collect();
+            let size: u64 = std::fs::read_dir(local.parent().unwrap()).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
+            println!("REAL {}: {} tris (host {}), {} textured materials (host {}), {} KB sent (file {} KB)", m.rsplit(['/', '\\']).next().unwrap(), mine.tris.len(), theirs.tris.len(), tex.len(), theirs.materials.iter().filter(|t| !t.is_empty()).count(), size / 1024, std::fs::metadata(m).unwrap().len() / 1024);
+            assert_eq!(mine.tris.len(), theirs.tris.len());
+            assert_eq!(tex.len(), theirs.materials.iter().filter(|t| !t.is_empty()).count());
+            assert!(tex.iter().all(|t| image::image_dimensions(t).is_ok()));
+        }
+        println!("host log: {:?}", h.s.log);
+    }
+
+    /// A model with huge textures still gets through: they're shrunk to fit.
+    #[test]
+    fn big_sketchfab_textures_are_shrunk_to_fit() {
+        let d = dir("gltf_big");
+        let src = d.join("big");
+        std::fs::create_dir_all(&src).unwrap();
+        // noise doesn't compress: ~40 MB of png, over the 32 MB transfer limit
+        let mut seed = 12345u32;
+        let img = image::RgbImage::from_fn(3700, 3700, |_, _| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            image::Rgb([(seed >> 24) as u8, (seed >> 16) as u8, (seed >> 8) as u8])
+        });
+        img.save(src.join("huge.png")).unwrap();
+        assert!(std::fs::metadata(src.join("huge.png")).unwrap().len() > 33 * 1024 * 1024);
+        let bin: Vec<u8> = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        std::fs::write(src.join("m.bin"), &bin).unwrap();
+        let gltf = serde_json::json!({
+            "asset": { "version": "2.0" }, "scenes": [{ "nodes": [0] }], "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [{ "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }, "material": 0 }] }],
+            "materials": [{ "pbrMetallicRoughness": { "baseColorTexture": { "index": 0 } } }],
+            "textures": [{ "source": 0 }], "images": [{ "uri": "huge.png" }],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" },
+                { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2" }
+            ],
+            "bufferViews": [{ "buffer": 0, "byteLength": 36 }, { "buffer": 0, "byteOffset": 36, "byteLength": 24 }],
+            "buffers": [{ "uri": "m.bin", "byteLength": 60 }]
+        });
+        std::fs::write(src.join("m.gltf"), gltf.to_string()).unwrap();
+        let model = src.join("m.gltf").to_string_lossy().to_string();
+        let mut hm = Map::default();
+        hm.add(Object::new(Kind::Prop { model: model.clone(), scale: Vec3::ONE, roblox_mesh_id: String::new() }, Vec3::ZERO, [255; 3], Material::Plastic));
+        let hs = Session::host(&mut hm, "H", [1, 1, 1], 0, false, d.join("host_cache")).unwrap();
+        let addr = format!("127.0.0.1:{}", hs.port);
+        let code = hs.code.clone();
+        let mut h = P::new(hs, hm);
+        let mut g = P::new(Session::join(&addr, &code, "G", [2, 2, 2], d.join("guest_cache")).unwrap(), Map::default());
+        wait(&mut [&mut h, &mut g], "join request", |p| p[0].s.pending.len() == 1);
+        let c = h.s.pending[0].conn;
+        h.s.approve(c, &h.m);
+        wait(&mut [&mut h, &mut g], "model download", |p| p[1].got.iter().any(|r| r.assets.iter().any(|a| a.0 == model)));
+        let local = g.got.iter().flat_map(|r| r.assets.clone()).find(|a| a.0 == model).unwrap().1;
+        let m = crate::mesh::load_model(&local.to_string_lossy()).unwrap();
+        let t = m.materials.iter().find(|t| !t.is_empty()).expect("still textured");
+        let (w, hh) = image::image_dimensions(t).unwrap();
+        assert!(w <= 2048 && hh <= 2048 && w >= 1024, "{w}x{hh}");
+        assert!(h.s.log.iter().any(|l| l.contains("shrunk to 2048")), "{:?}", h.s.log);
     }
 
     #[test]
@@ -2280,6 +2619,45 @@ mod plugin_web_api {
         let found = find_files(std::path::Path::new(&dir), "gltf", &root);
         assert_eq!(found.len(), 1);
         assert!(found[0].ends_with("scene.gltf"));
+    }
+
+    /// A download that stops halfway must fail, not leave half a model
+    /// that looks finished (a 48 MB Sketchfab chair arrived as 16 MB).
+    #[test]
+    fn cut_off_downloads_fail() {
+        let dir = crate::tests::out_dir("cut_off");
+        let p = dir.join("chair.glb");
+        let _ = std::fs::remove_file(&p);
+        let data = vec![7u8; 3_000_000];
+        // the server said 3 MB but only 1 MB came
+        let r = save_body(&data[..1_000_000], 3_000_000, &p, &|_| {});
+        assert!(r.as_ref().is_err_and(|e| e.contains("cut off")), "{r:?}");
+        assert!(!p.exists(), "no half file left behind");
+        // the connection breaks partway
+        struct Breaks(usize);
+        impl std::io::Read for Breaks {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"));
+                }
+                self.0 -= 1;
+                b[0] = 1;
+                Ok(1)
+            }
+        }
+        assert!(save_body(Breaks(500), 0, &p, &|_| {}).is_err());
+        assert!(!p.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".part")).collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // a whole download, also when replacing an older copy
+        std::fs::write(&p, b"old").unwrap();
+        let last = std::cell::Cell::new(0);
+        save_body(&data[..], 3_000_000, &p, &|g| last.set(g)).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), data);
+        assert_eq!(last.get(), 3_000_000, "progress reaches the end");
+        // size unknown (or compressed): whatever arrives is kept
+        save_body(&data[..10], 0, &p, &|_| {}).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap().len(), 10);
     }
 
     #[test]

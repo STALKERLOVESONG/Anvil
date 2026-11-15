@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.3
+
+- **Team Create:** props now arrive textured. Each prop's `.mtl` and texture images are
+  sent with its `.obj`, including Half-Life props imported from a mounted game, so
+  friends without the game see them properly.
+  - The sender only sends `.mtl` and image files from the model's own folder area or
+    Anvil's content folder.
+  - The receiver only accepts plain file names, written into the model's own sandbox
+    folder.
+- **Team Create:** Sketchfab models (and any `.glb` / `.gltf`) now arrive textured.
+  - A `.gltf` from a zip used to not arrive at all, and a `.glb` over 24 MB didn't either.
+    Now they go as one `.gltf` plus its `.bin` and textures.
+  - If a model is too big for a transfer, its textures are shrunk step by step
+    (2048, then 1024 px…) until it fits.
+  - The receiver only accepts a `.gltf` whose every file came with it.
+- **Packages** (`.anvilpak`) now include a `.gltf` prop's `.bin` and textures.
+- **Sketchfab downloads** no longer get cut off.
+  - Every download had 30 seconds in total, so bigger models came out half-written
+    (and couldn't be loaded). Now a download takes as long as it needs while data
+    keeps coming.
+  - A download that stops halfway is reported as failed and leaves no half file behind.
+
 ## 0.2.2
 
 - **Fixed:** clicking *Download* in the Sketchfab window failed with "Function not found:
