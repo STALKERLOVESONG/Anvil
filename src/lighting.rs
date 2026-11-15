@@ -260,7 +260,7 @@ impl ShadowMap {
                 1.0
             }
         };
-        let (x, y) = (u.floor() as i64, v.floor() as i64);
+        let (x, y) = (crate::texture::ffloor(u) as i64, crate::texture::ffloor(v) as i64);
         if !soft {
             return test(x, y);
         }

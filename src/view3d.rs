@@ -15,7 +15,7 @@ pub const NEAR: f32 = 0.05;
 /// Depth range used by orthographic views (depth = 1 - z / ORTHO_FAR).
 const ORTHO_FAR: f32 = 100_000.0;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Camera {
     pub pos: Vec3,
     pub yaw: f32,
@@ -208,6 +208,8 @@ struct LitCtx<'a> {
     cy: f32,
     k: f32,
     ortho: bool,
+    /// Fog color, when fog is added per pixel while drawing.
+    fog: Option<[f32; 3]>,
 }
 
 impl LitCtx<'_> {
@@ -221,6 +223,19 @@ impl LitCtx<'_> {
         let (sx, sy) = ((px - self.cx) / self.k, -(py - self.cy) / self.k);
         let (vx, vy) = if self.ortho { (sx, sy) } else { (sx * vz, sy * vz) };
         self.cam + self.r * vx + self.u * vy + self.f * vz
+    }
+    /// Blends a finished color toward the fog color by distance.
+    #[inline]
+    fn fogged(&self, c: [u8; 3], z: f32) -> [u8; 3] {
+        let Some(fc) = self.fog else { return c };
+        let vz = self.view_z(z);
+        let l = self.l;
+        if vz <= l.fog_start {
+            return c;
+        }
+        let t = ((vz - l.fog_start) / (l.fog_end - l.fog_start).max(1.0)).clamp(0.0, 1.0);
+        let t = t * t * (3.0 - 2.0 * t) * 0.92;
+        [(c[0] as f32 + (fc[0] - c[0] as f32) * t) as u8, (c[1] as f32 + (fc[1] - c[1] as f32) * t) as u8, (c[2] as f32 + (fc[2] - c[2] as f32) * t) as u8]
     }
     #[inline]
     fn shade(&self, base: [f32; 3], px: f32, py: f32, z: f32, n: Vec3, metallic: bool, lmask: u64) -> [f32; 3] {
@@ -305,13 +320,19 @@ struct Band<'a> {
     ortho: bool,
     bilinear: bool,
     lit: Option<&'a LitCtx<'a>>,
+    /// Pixels shaded (for profiling overdraw).
+    shaded: usize,
 }
 
 impl Band<'_> {
     fn fill(&mut self, t: &RTri, write_depth: bool) {
         let (a, b, c) = (t.p[0], t.p[1], t.p[2]);
-        let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-        if area.abs() < 1e-6 || !area.is_finite() {
+        // Coverage math in f64: a triangle reaching behind the camera can have
+        // a corner thousands of pixels off screen, and in f32 that made far
+        // edges come out jagged (steps along the horizon).
+        let (ax, ay, bx, by, cx, cy) = (a.x as f64, a.y as f64, b.x as f64, b.y as f64, c.x as f64, c.y as f64);
+        let area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        if area.abs() < 1e-9 || !area.is_finite() {
             return;
         }
         let wf = self.w as f32;
@@ -323,23 +344,50 @@ impl Band<'_> {
             return;
         }
         let inv = 1.0 / area;
-        let (x0, x1, y0, y1) = (minx as usize, maxx as usize, miny as usize, maxy as usize);
+        // each barycentric weight is its own edge function: w = ex * px + ey * py + e0
+        let edge = |px0: f64, py0: f64, px1: f64, py1: f64| -> (f64, f64, f64) {
+            let (ex, ey) = (-(py1 - py0) * inv, (px1 - px0) * inv);
+            (ex, ey, -(ex * px0 + ey * py0))
+        };
+        let e = [edge(bx, by, cx, cy), edge(cx, cy, ax, ay), edge(ax, ay, bx, by)];
+        let (x0, x1, y0, y1) = (minx as i64, maxx as i64, miny as usize, maxy as usize);
         for y in y0..=y1 {
             let py = y as f32 + 0.5;
+            let pyd = py as f64;
             let row = (y - self.y0) * self.w;
-            for x in x0..=x1 {
-                let px = x as f32 + 0.5;
-                let w0 = ((c.x - b.x) * (py - b.y) - (c.y - b.y) * (px - b.x)) * inv;
-                let w1 = ((a.x - c.x) * (py - c.y) - (a.y - c.y) * (px - c.x)) * inv;
-                let w2 = 1.0 - w0 - w1;
-                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                    continue;
+            // the run of pixel centers inside all three edges on this row
+            let (mut lo, mut hi) = (x0 as f64 + 0.5, x1 as f64 + 0.5);
+            let mut empty = false;
+            for (ex, ey, e0) in e {
+                let k = ey * pyd + e0;
+                if ex.abs() < 1e-30 {
+                    if k < 0.0 {
+                        empty = true;
+                    }
+                } else if ex > 0.0 {
+                    lo = lo.max(-k / ex);
+                } else {
+                    hi = hi.min(-k / ex);
                 }
+            }
+            if empty || lo > hi {
+                continue;
+            }
+            let xs = ((lo - 0.5).ceil() as i64).max(x0);
+            let xe = ((hi - 0.5).floor() as i64).min(x1);
+            for x in xs..=xe {
+                let x = x as usize;
+                let px = x as f32 + 0.5;
+                let pxd = px as f64;
+                let w0 = (e[0].0 * pxd + e[0].1 * pyd + e[0].2).max(0.0) as f32;
+                let w1 = (e[1].0 * pxd + e[1].1 * pyd + e[1].2).max(0.0) as f32;
+                let w2 = (e[2].0 * pxd + e[2].1 * pyd + e[2].2).max(0.0) as f32;
                 let z = w0 * a.z + w1 * b.z + w2 * c.z;
                 let i = row + x;
                 if z <= self.depth[i] {
                     continue;
                 }
+                self.shaded += 1;
                 let (out, alpha) = match &t.shade {
                     Shade::Flat { fast, base, alpha, sel } => match self.lit {
                         None => (*fast, *alpha),
@@ -350,17 +398,17 @@ impl Band<'_> {
                         if ww <= 0.0 {
                             continue;
                         }
-                        let uv = (t.uvw[0] * w0 + t.uvw[1] * w1 + t.uvw[2] * w2) / ww;
+                        let iw = 1.0 / ww;
+                        let uv = (t.uvw[0] * w0 + t.uvw[1] * w1 + t.uvw[2] * w2) * iw;
                         // exact texels-per-pixel here -> mip level (no shimmer / moire far away)
                         let (ut, vt) = (uv.x * t.tsize.x, uv.y * t.tsize.y);
                         let g = &t.grad;
-                        let iw = 1.0 / ww;
                         let dudx = (g[0] - ut * g[4]) * iw;
                         let dudy = (g[1] - ut * g[5]) * iw;
                         let dvdx = (g[2] - vt * g[4]) * iw;
                         let dvdy = (g[3] - vt * g[5]) * iw;
                         let rho2 = (dudx * dudx + dvdx * dvdx).max(dudy * dudy + dvdy * dvdy);
-                        let lod = if rho2 > 1.0 { 0.5 * rho2.log2() } else { 0.0 };
+                        let lod = crate::texture::mip_level(rho2) as f32;
                         // bilinear only matters when magnified; mips already smooth the rest
                         let s = paint.tex.sample_lod(uv.x, uv.y, lod, self.bilinear && lod < 1.0);
                         let mut alpha = paint.alpha;
@@ -384,6 +432,10 @@ impl Band<'_> {
                             Some(lc) => (finish3(lc.shade(col, px, py, z, bumped.unwrap_or(t.n), paint.metallic, t.lmask), *selected), alpha),
                         }
                     }
+                };
+                let out = match self.lit {
+                    Some(lc) => lc.fogged(out, z),
+                    None => out,
                 };
                 if write_depth {
                     self.depth[i] = z;
@@ -473,6 +525,10 @@ pub struct Renderer {
     tex: Option<egui::TextureHandle>,
     /// Sun shadow map, kept until something that casts a shadow changes.
     shadow: Option<(u64, Arc<crate::lighting::ShadowMap>)>,
+    /// What the last frame showed: the same inputs reuse it as is.
+    last_key: Option<u64>,
+    /// How long the last full-resolution frame took (ms).
+    pub full_ms: f32,
 }
 
 impl Renderer {
@@ -491,13 +547,42 @@ impl Renderer {
         let ppp = ctx.pixels_per_point();
         let w = ((rect.width() * ppp * o.scale).round() as usize).clamp(1, 4096);
         let h = ((rect.height() * ppp * o.scale).round() as usize).clamp(1, 4096);
+        // nothing changed since the last frame: show it again
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hs = std::collections::hash_map::DefaultHasher::new();
+            (w, h).hash(&mut hs);
+            for f in [cam.pos.x, cam.pos.y, cam.pos.z, cam.yaw, cam.pitch, cam.ortho, o.fov, o.grid, o.plane_y, o.scale] {
+                f.to_bits().hash(&mut hs);
+            }
+            (o.show_grid, o.outlines, o.bg, o.filter, textures.version).hash(&mut hs);
+            format!("{:?}", o.lighting).hash(&mut hs);
+            for wm in scene {
+                (Arc::as_ptr(wm) as usize).hash(&mut hs);
+            }
+            selected.hash(&mut hs);
+            let mut rs: Vec<(&u64, &[u8; 3])> = remote_sel.iter().collect();
+            rs.sort();
+            rs.hash(&mut hs);
+            hs.finish()
+        };
+        if self.last_key == Some(key) {
+            if let Some(t) = &self.tex {
+                return t.id();
+            }
+        }
+        self.last_key = Some(key);
+        let started = std::time::Instant::now();
         if w != self.w || h != self.h {
             self.w = w;
             self.h = h;
             self.color = vec![0; w * h * 4];
             self.depth = vec![0.0; w * h];
         }
+        let prof = std::env::var_os("ANVIL_PROFILE").is_some();
+        let t0 = std::time::Instant::now();
         let frame = build_frame(w, h, cam, o, scene, selected, remote_sel, textures);
+        let t_build = t0.elapsed();
 
         let ortho = cam.is_ortho();
         let lg = &o.lighting;
@@ -520,9 +605,12 @@ impl Renderer {
             None
         };
         let (br, bu, bf) = cam.basis();
-        let lc = lg.on.then(|| LitCtx { l: lg, shadow: shadow.as_deref(), cam: cam.pos, r: br, u: bu, f: bf, cx: w as f32 * 0.5, cy: h as f32 * 0.5, k: cam.px_scale(h as f32, o.fov), ortho });
-        let lc = lc.as_ref();
         let sky = lg.on && lg.sky && !ortho;
+        // without AO, fog is added while drawing (no extra pass over the screen)
+        let fog_col = if sky { lg.sky_horizon } else { [o.bg[0] as f32, o.bg[1] as f32, o.bg[2] as f32] };
+        let fog_in_fill = lg.on && lg.fog && !ortho && !lg.ao;
+        let lc = lg.on.then(|| LitCtx { l: lg, shadow: shadow.as_deref(), cam: cam.pos, r: br, u: bu, f: bf, cx: w as f32 * 0.5, cy: h as f32 * 0.5, k: cam.px_scale(h as f32, o.fov), ortho, fog: fog_in_fill.then_some(fog_col) });
+        let lc = lc.as_ref();
 
         // pass 1 (row bands in parallel): background, grid, solid surfaces
         let bg = [o.bg[0], o.bg[1], o.bg[2], 255];
@@ -538,7 +626,7 @@ impl Renderer {
         let b_sel = bin(&frame.sel, nb, rows, line_y);
         let frame = &frame;
         let o = &*o;
-        self.color.par_chunks_mut(w * 4 * rows).zip(self.depth.par_chunks_mut(w * rows)).enumerate().for_each(|(bi, (cb, db))| {
+        let shaded: usize = self.color.par_chunks_mut(w * 4 * rows).zip(self.depth.par_chunks_mut(w * rows)).enumerate().map(|(bi, (cb, db))| {
             let y0 = bi * rows;
             if sky {
                 for (ry, row) in cb.chunks_exact_mut(w * 4).enumerate() {
@@ -556,26 +644,27 @@ impl Renderer {
                 }
             }
             db.fill(0.0);
-            let mut band = Band { w, y0, rows: db.len() / w, color: cb, depth: db, ortho, bilinear: o.filter, lit: lc };
+            let mut band = Band { w, y0, rows: db.len() / w, color: cb, depth: db, ortho, bilinear: o.filter, lit: lc, shaded: 0 };
             for &i in &b_grid[bi] {
                 band.line(&frame.grid[i as usize]);
             }
             for &i in &b_opaque[bi] {
                 band.fill(&frame.opaque[i as usize], true);
             }
-        });
+            band.shaded
+        }).sum();
 
+        let t_p1 = t0.elapsed();
         // pass 2: ambient occlusion and fog, reading the finished depth buffer
         if let Some(lc) = lc {
-            if lg.ao || (lg.fog && !ortho) {
-                let fog_col = if sky { lg.sky_horizon } else { [o.bg[0] as f32, o.bg[1] as f32, o.bg[2] as f32] };
+            if lg.ao || (lg.fog && !ortho && !fog_in_fill) {
                 post_light(&mut self.color, &self.depth, w, rows, lc, fog_col);
             }
         }
 
         // pass 3: outlines, see-through objects, selection
         self.color.par_chunks_mut(w * 4 * rows).zip(self.depth.par_chunks_mut(w * rows)).enumerate().for_each(|(bi, (cb, db))| {
-            let mut band = Band { w, y0: bi * rows, rows: db.len() / w, color: cb, depth: db, ortho, bilinear: o.filter, lit: lc };
+            let mut band = Band { w, y0: bi * rows, rows: db.len() / w, color: cb, depth: db, ortho, bilinear: o.filter, lit: lc, shaded: 0 };
             for &i in &b_outlines[bi] {
                 band.line(&frame.outlines[i as usize]);
             }
@@ -587,12 +676,27 @@ impl Renderer {
             }
         });
 
-        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &self.color);
+        let t_p3 = t0.elapsed();
+        let pixels: Vec<egui::Color32> = self.color.par_chunks_exact(4).map(|p| egui::Color32::from_rgb(p[0], p[1], p[2])).collect();
+        let image = egui::ColorImage { size: [w, h], pixels };
         match &mut self.tex {
             Some(t) => t.set(image, egui::TextureOptions::LINEAR),
             None => self.tex = Some(ctx.load_texture("anvil-3d-view", image, egui::TextureOptions::LINEAR)),
         }
+        if o.scale >= 0.99 {
+            self.full_ms = started.elapsed().as_secs_f32() * 1000.0;
+        }
+        if prof {
+            eprintln!("SHADED {shaded} px for {} screen px", w * h);
+            eprintln!("PROFILE {w}x{h} tris {} | build {:?} pass1 {:?} pass2+3 {:?} upload {:?}", frame.opaque.len(), t_build, t_p1 - t_build, t_p3 - t_p1, t0.elapsed() - t_p3);
+        }
         self.tex.as_ref().map(|t| t.id()).unwrap_or_default()
+    }
+
+    /// Forget the last frame, so the next render draws again (benchmarks).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn invalidate(&mut self) {
+        self.last_key = None;
     }
 
     /// The last rendered frame (RGBA).
@@ -694,6 +798,7 @@ fn build_frame(
         }
     }
 
+    let tb = std::time::Instant::now();
     // what's on screen: each object's box against the view frustum, and
     // objects too far away to cover a pixel are skipped (selected ones stay)
     let (wf, hf) = (w as f32, h as f32);
@@ -720,9 +825,19 @@ fn build_frame(
     };
     // one shared Paint per texture slot (loading textures needs the cache, so
     // this part runs first, one object after another)
-    let visible: Vec<(&Arc<WorldMesh>, Vec<Option<Arc<Paint>>>)> = scene
+    // nearest first: what's behind then fails the depth test before it's shaded
+    let mut order: Vec<(f32, &Arc<WorldMesh>)> = scene
         .iter()
         .filter(|wm| on_screen(wm))
+        .map(|wm| {
+            let c = cam.to_view((wm.min + wm.max) * 0.5, &basis);
+            (c.z - (wm.max - wm.min).length() * 0.5, wm)
+        })
+        .collect();
+    order.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let visible: Vec<(&Arc<WorldMesh>, Vec<Option<Arc<Paint>>>)> = order
+        .into_iter()
+        .map(|(_, wm)| wm)
         .map(|wm| {
             let paints = wm
                 .texs
@@ -743,6 +858,7 @@ fn build_frame(
             (wm, paints)
         })
         .collect();
+    let t_vis = tb.elapsed();
     // triangle setup for all objects in parallel
     let parts: Vec<Frame> = visible
         .into_par_iter()
@@ -877,7 +993,9 @@ fn build_frame(
         }
         // outlines and selection wireframes
         let sel_col = if sel { Some([255, 215, 70]) } else { remote_sel.get(&wm.id).copied() };
-        if sel_col.is_some() || (o.outlines && !wm.decal) {
+        // detailed models (props) get no outline: hundreds of edges per prop drew
+        // dark wireframes over them and slowed big maps down
+        if sel_col.is_some() || (o.outlines && !wm.decal && wm.mesh.edges.len() <= 400) {
             let (col, bias, list) = match sel_col {
                 Some(c) => (c, 1.02, &mut part.sel),
                 None => ([(wm.color[0] as f32 * 0.4) as u8, (wm.color[1] as f32 * 0.4) as u8, (wm.color[2] as f32 * 0.4) as u8], 1.004, &mut part.outlines),
@@ -891,6 +1009,7 @@ fn build_frame(
             part
         })
         .collect();
+    let t_par = tb.elapsed();
     for p in parts {
         f.opaque.extend(p.opaque);
         f.deferred.extend(p.deferred);
@@ -898,6 +1017,9 @@ fn build_frame(
         f.sel.extend(p.sel);
     }
     f.deferred.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    if std::env::var_os("ANVIL_PROFILE").is_some() {
+        eprintln!("BUILD visible+paints {:?} setup {:?} merge {:?}", t_vis, t_par - t_vis, tb.elapsed() - t_par);
+    }
     f
 }
 
@@ -907,6 +1029,18 @@ fn build_frame(
 /// buffer (1/z) is linear, so the pair's average matches the middle; in a
 /// crease (floor meeting a wall) the neighbors are closer than that, which
 /// darkens it. Flat floors seen at an angle don't get false shadows.
+/// (sin, cos) of the 8 small per-pixel AO rotations (k * 0.098 rad).
+const AO_ROT: [(f32, f32); 8] = [
+    (0.0000000, 1.0000000),
+    (0.0978432, 0.9952018),
+    (0.1947475, 0.9808534),
+    (0.2897829, 0.9570924),
+    (0.3820375, 0.9241468),
+    (0.4706259, 0.8823329),
+    (0.5546980, 0.8320517),
+    (0.6334471, 0.7737860),
+];
+
 fn post_light(color: &mut [u8], depth: &[f32], w: usize, rows: usize, lc: &LitCtx, fog_col: [f32; 3]) {
     let l = lc.l;
     let h = depth.len() / w.max(1);
@@ -929,14 +1063,14 @@ fn post_light(color: &mut [u8], depth: &[f32], w: usize, rows: usize, lc: &LitCt
                     let rpx = if lc.ortho { lc.k * R } else { lc.k * R / vz };
                     if rpx >= 1.5 {
                         let rpx = rpx.min(28.0);
-                        let rot = ((x * 7 + y * 13) % 8) as f32 * 0.098;
-                        let (sr, cr) = rot.sin_cos();
+                        let (sr, cr) = AO_ROT[(x * 7 + y * 13) % 8];
                         let mut occ = 0.0;
                         let mut cnt = 0.0;
                         for (dx, dy) in dirs {
                             let (dx, dy) = (dx * cr - dy * sr, dx * sr + dy * cr);
                             for rad in [rpx * 0.7, rpx * 0.35].into_iter().take(l.ao_rings.max(1) as usize) {
-                                let (ox, oy) = ((dx * rad).round() as i64, (dy * rad).round() as i64);
+                                let r = |v: f32| crate::texture::ffloor(v + 0.5) as i64;
+                                let (ox, oy) = (r(dx * rad), r(dy * rad));
                                 let (ax, ay, bx, by) = (x as i64 + ox, y as i64 + oy, x as i64 - ox, y as i64 - oy);
                                 if ax < 0 || bx < 0 || ay < 0 || by < 0 || ax >= w as i64 || bx >= w as i64 || ay >= h as i64 || by >= h as i64 {
                                     continue;
@@ -960,7 +1094,7 @@ fn post_light(color: &mut [u8], depth: &[f32], w: usize, rows: usize, lc: &LitCt
                 }
                 let o = (yy * w + x) * 4;
                 let mut c = [cb[o] as f32 * k, cb[o + 1] as f32 * k, cb[o + 2] as f32 * k];
-                if l.fog && !lc.ortho && vz > l.fog_start {
+                if l.fog && !lc.ortho && lc.fog.is_none() && vz > l.fog_start {
                     let t = ((vz - l.fog_start) / (l.fog_end - l.fog_start).max(1.0)).clamp(0.0, 1.0);
                     let t = t * t * (3.0 - 2.0 * t) * 0.92;
                     for ch in 0..3 {

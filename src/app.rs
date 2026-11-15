@@ -238,6 +238,9 @@ pub struct AnvilApp {
     pub(crate) hovered_slot: Option<usize>,
     pub(crate) title: String,
     pub(crate) layout_pts: Vec<Vec3>,
+    /// Camera as last drawn, and when it last moved (for drawing faster while moving).
+    pub(crate) last_cam: Option<crate::view3d::Camera>,
+    pub(crate) cam_moved_at: f64,
     pub(crate) edit: Option<EditState>,
     pub(crate) play: Option<(Play, Layout)>,
     pub(crate) plugins: PluginHost,
@@ -521,6 +524,8 @@ impl AnvilApp {
             hovered_slot: None,
             title: String::new(),
             layout_pts: Vec::new(),
+            last_cam: None,
+            cam_moved_at: 0.0,
             edit: None,
             play: None,
             plugins: PluginHost::new_trusted(&trusted_plugins),
@@ -1228,13 +1233,18 @@ impl AnvilApp {
             return;
         }
         match Map::load(&p) {
-            Ok(m) => {
+            Ok(mut m) => {
+                let refit = crate::trim::refit_old_slabs(&mut m);
                 self.map = m;
                 self.path = Some(p.clone());
-                self.dirty = false;
+                self.dirty = refit > 0;
                 self.reset_after_load();
                 self.add_recent(&p);
-                self.status = format!("Opened {}", p.display());
+                self.status = if refit > 0 {
+                    format!("Opened {} (fixed {refit} floor / ceiling piece(s) of older buildings so they line up with the walls; save to keep it)", p.display())
+                } else {
+                    format!("Opened {}", p.display())
+                };
             }
             Err(e) => self.status = e,
         }
@@ -3128,6 +3138,21 @@ impl AnvilApp {
         self.texture_drop_3d(rect, &resp, scene, &ctx);
         let drop_resp = resp.clone();
 
+        // while the camera moves, a slow view draws at lower resolution, then
+        // sharp again a moment after it stops
+        let now = ctx.input(|i| i.time);
+        if self.last_cam != Some(self.cam) {
+            self.last_cam = Some(self.cam);
+            self.cam_moved_at = now;
+        }
+        let moving = now - self.cam_moved_at < 0.2;
+        let mut scale = self.settings.render_scale.clamp(0.25, 2.0);
+        if moving && self.settings.fast_motion && self.renderer.full_ms > 14.0 {
+            scale *= (14.0 / self.renderer.full_ms).sqrt().clamp(0.4, 0.8);
+        }
+        if moving {
+            ctx.request_repaint_after(std::time::Duration::from_millis(220));
+        }
         let opts = RenderOpts {
             fov: self.settings.fov,
             grid: self.settings.grid,
@@ -3135,7 +3160,7 @@ impl AnvilApp {
             show_grid: self.settings.show_grid_3d,
             outlines: self.settings.outlines_3d,
             bg: self.settings.bg_3d,
-            scale: self.settings.render_scale.clamp(0.25, 2.0),
+            scale,
             filter: self.settings.texture_filtering,
             lighting: self.lighting(),
         };

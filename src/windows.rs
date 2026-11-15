@@ -745,6 +745,9 @@ pub(crate) fn settings_ui(ui: &mut egui::Ui, s: &mut Settings) -> bool {
             ui.label("3D render scale");
             ui.add(egui::Slider::new(&mut s.render_scale, 0.25..=2.0));
             ui.end_row();
+            ui.label("");
+            ui.checkbox(&mut s.fast_motion, "Faster while moving").on_hover_text("If the 3D view is slow, it draws at lower resolution while the camera moves and sharpens when it stops");
+            ui.end_row();
             ui.label("Preview texture size");
             egui::ComboBox::from_id_salt("tex_quality").selected_text(format!("{} px", s.preview_texture_size)).show_ui(ui, |ui| {
                 for v in [256u32, 512, 1024, 2048] {

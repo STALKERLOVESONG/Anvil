@@ -201,3 +201,44 @@ impl AnvilApp {
         out
     }
 }
+
+/// Buildings made before 0.2.4 have a floor and ceiling that stop at the
+/// middle of the walls (a step on the outside). Refits those to the walls'
+/// outer edge, keeping their look. Returns how many slabs were fixed.
+pub fn refit_old_slabs(map: &mut Map) -> usize {
+    let folders: Vec<u64> = map.folders.iter().map(|f| f.id).collect();
+    let mut fixed = 0;
+    for f in folders {
+        let Some((pts, t, _, _)) = building_outline(map, Some(f)) else { continue };
+        let outer = inset_outline(&pts, -t * 0.5);
+        for o in map.objects.iter_mut().filter(|o| o.folder == Some(f) && (o.name == "Floor" || o.name == "Ceiling")) {
+            // its footprint (flat corners), and its thickness and bottom
+            let (corners, bottom, thick) = match &o.kind {
+                Kind::Mesh { verts, .. } => {
+                    let world: Vec<Vec3> = verts.iter().map(|v| o.to_world(*v)).collect();
+                    let (lo, hi) = world.iter().fold((f32::MAX, f32::MIN), |(a, b), p| (a.min(p.y), b.max(p.y)));
+                    let mut c: Vec<Vec3> = world.iter().filter(|p| (p.y - lo).abs() < 1e-3).map(|p| Vec3::new(p.x, 0.0, p.z)).collect();
+                    c.dedup_by(|a, b| (*a - *b).length() < 1e-4);
+                    (c, lo, hi - lo)
+                }
+                Kind::Brush { shape: Shape::Box, size, .. } if o.rot.length() < 1e-3 => {
+                    let h = *size * 0.5;
+                    let c = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].iter().map(|(sx, sz)| Vec3::new(o.pos.x + sx * h.x, 0.0, o.pos.z + sz * h.z)).collect();
+                    (c, o.pos.y - h.y, size.y)
+                }
+                _ => continue,
+            };
+            // only if it's the old one: its corners are the walls' center line
+            let on_center = corners.len() == pts.len() && corners.iter().all(|c| pts.iter().any(|p| (Vec3::new(p.x, 0.0, p.z) - *c).length() < 1e-2));
+            if !on_center || thick <= 0.0 {
+                continue;
+            }
+            let new = crate::building::slab(&outer, bottom, thick, o.color, o.material);
+            o.kind = new.kind;
+            o.pos = new.pos;
+            o.rot = new.rot;
+            fixed += 1;
+        }
+    }
+    fixed
+}

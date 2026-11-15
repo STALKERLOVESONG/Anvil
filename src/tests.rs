@@ -3328,6 +3328,7 @@ fn bench_busy_map() {
         let n = 5;
         let t = std::time::Instant::now();
         for _ in 0..n {
+            r.invalidate();
             r.render(&ctx, rect, &cam, &opts, &scene, &[], &HashMap::new(), &mut tc);
         }
         println!("BENCH {name}: {:?} per frame", t.elapsed() / n);
@@ -3384,5 +3385,198 @@ fn far_detail_lods_look_the_same() {
         assert!(covered > 20, "visible at {dist}");
         println!("LOD at {dist}: {diff} of {covered} pixels differ");
         assert!(diff * 100 <= covered * 6 + 800, "at distance {dist}: {diff} of {covered} pixels differ");
+    }
+}
+
+/// Profiles a real map: ANVIL_MAP=path cargo test --release bench_real_map -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_real_map() {
+    use crate::view3d::{Camera, RenderOpts, Renderer};
+    let Ok(path) = std::env::var("ANVIL_MAP") else { return };
+    let mut map = Map::load(std::path::Path::new(&path)).unwrap();
+    println!("REAL refit {} old floor/ceiling piece(s)", crate::trim::refit_old_slabs(&mut map));
+    let mut models = ModelCache::default();
+    let t = std::time::Instant::now();
+    let mut sc = crate::mesh::SceneCache::default();
+    let scene = sc.build(&map, &mut models);
+    let tris: usize = scene.iter().map(|w| w.mesh.tris.len()).sum();
+    println!("REAL scene: {} objects, {} triangles, {} textures, built in {:?}", scene.len(), tris, map.textures.len(), t.elapsed());
+    let mut kinds: HashMap<&str, (usize, usize)> = HashMap::new();
+    for (o, w) in map.objects.iter().filter(|o| !o.hidden).zip(scene.iter()) {
+        let e = kinds.entry(o.type_label()).or_default();
+        e.0 += 1;
+        e.1 += w.mesh.tris.len();
+    }
+    println!("REAL kinds: {kinds:?}");
+    let mut heavy: Vec<(usize, String, usize)> = map.objects.iter().filter(|o| !o.hidden).zip(scene.iter()).map(|(o, w)| (w.mesh.tris.len(), o.name.clone(), w.lods.len())).collect();
+    heavy.sort_by(|a, b| b.0.cmp(&a.0));
+    println!("REAL heaviest: {:?}", &heavy[..heavy.len().min(8)]);
+    let (mn, mx) = scene.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), w| (a.min(w.min), b.max(w.max)));
+    println!("REAL bounds {mn} {mx}");
+    let c = (mn + mx) * 0.5;
+    let ext = (mx - mn) * 0.5;
+    let ctx = eframe::egui::Context::default();
+    let rect = eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::vec2(1310.0, 890.0));
+    let mut tc = crate::texture::TexCache::default();
+    let st = crate::settings::Settings::default();
+    let sun = crate::lighting::sun_dir(st.sun_azimuth, st.sun_elevation);
+    for q in [0u8, 1, 2] {
+        for (name, eye, at) in [
+            ("corner", Vec3::new(mn.x - 4.0, mn.y + 6.0, mn.z - 4.0), c),
+            ("ground", Vec3::new(c.x, mn.y + 3.0, mn.z - 2.0), Vec3::new(c.x, mn.y + 2.0, mx.z)),
+            ("overview", c + Vec3::new(-ext.x, ext.y.max(20.0) + 20.0, -ext.z) * 1.2, c),
+            ("user", Vec3::new(36.0, 4.0, -45.0), Vec3::new(20.0, 3.0, 60.0)),
+            ("user2", Vec3::new(33.0, 9.0, 40.0), Vec3::new(-60.0, 3.0, -60.0)),
+            ("user3", Vec3::new(18.0, 2.5, 31.5), Vec3::new(-100.0, 4.0, 40.0)),
+        ] {
+            let cam = Camera::looking_at(eye, at);
+            let opts = RenderOpts { fov: 70.0, grid: 1.0, plane_y: 0.0, show_grid: true, outlines: true, bg: [58, 66, 80], scale: 1.0, filter: true, lighting: crate::lighting::preset(q, sun, true, st.fog_distance, true) };
+            let mut r = Renderer::default();
+            r.render(&ctx, rect, &cam, &opts, &scene, &[], &HashMap::new(), &mut tc);
+            let n = 4;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                r.invalidate();
+                r.render(&ctx, rect, &cam, &opts, &scene, &[], &HashMap::new(), &mut tc);
+            }
+            println!("REAL light {q} {name}: {:?} per frame", t.elapsed() / n);
+            let (w, h, px) = r.pixels();
+            write_png(&out_dir("real").join(format!("{name}_q{q}.png")), w, h, px);
+        }
+    }
+}
+
+/// Which per-pixel feature costs what, on a real map (ANVIL_MAP).
+#[test]
+#[ignore]
+fn bench_real_map_features() {
+    use crate::view3d::{Camera, RenderOpts, Renderer};
+    let Ok(path) = std::env::var("ANVIL_MAP") else { return };
+    let mut map = Map::load(std::path::Path::new(&path)).unwrap();
+    let mut models = ModelCache::default();
+    let ctx = eframe::egui::Context::default();
+    let rect = eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::vec2(1310.0, 890.0));
+    let st = crate::settings::Settings::default();
+    let sun = crate::lighting::sun_dir(st.sun_azimuth, st.sun_elevation);
+    let cam = Camera::looking_at(Vec3::new(33.0, 9.0, 40.0), Vec3::new(-60.0, 3.0, -60.0));
+    let time = |label: &str, map: &Map, models: &mut ModelCache, lit: u8, filter: bool, grid: bool| {
+        let scene = crate::mesh::SceneCache::default().build(map, models);
+        let mut tc = crate::texture::TexCache::default();
+        if let Ok(d) = std::env::var("ANVIL_TEXDIM") {
+            tc.set_max_dim(d.parse().unwrap());
+        }
+        let opts = RenderOpts { fov: 70.0, grid: 1.0, plane_y: 0.0, show_grid: grid, outlines: true, bg: [58, 66, 80], scale: 1.0, filter, lighting: crate::lighting::preset(lit, sun, true, st.fog_distance, true) };
+        let mut r = Renderer::default();
+        r.render(&ctx, rect, &cam, &opts, &scene, &[], &HashMap::new(), &mut tc);
+        let n = 10;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            r.invalidate();
+            r.render(&ctx, rect, &cam, &opts, &scene, &[], &HashMap::new(), &mut tc);
+        }
+        println!("FEAT {label}: {:?}", t.elapsed() / n);
+    };
+    time("full (light 1)", &map, &mut models, 1, true, true);
+    time("no lighting", &map, &mut models, 0, true, true);
+    time("no filtering", &map, &mut models, 1, false, true);
+    time("no grid", &map, &mut models, 1, true, false);
+    for t in &mut map.textures {
+        t.normal_map.clear();
+    }
+    time("no normal maps", &map, &mut models, 1, true, true);
+    for o in &mut map.objects {
+        o.texture = None;
+        o.face_tex.clear();
+    }
+    time("no textures", &map, &mut models, 1, true, true);
+    time("no textures, no lighting", &map, &mut models, 0, true, true);
+}
+
+#[test]
+#[ignore]
+fn bench_texture_sampling() {
+    let img = image::RgbaImage::from_fn(1024, 1024, |x, y| image::Rgba([(x * 7) as u8, (y * 3) as u8, (x ^ y) as u8, 255]));
+    let p = out_dir("texbench").join("t.png");
+    img.save(&p).unwrap();
+    let tex = crate::texture::load(&p.to_string_lossy(), 1024).unwrap();
+    for (label, lod, bil) in [("lod0 nearest", 0.0f32, false), ("lod0 bilinear", 0.0, true), ("lod2 nearest", 2.0, false)] {
+        let n = 2_000_000;
+        let t = std::time::Instant::now();
+        let mut acc = 0u32;
+        for i in 0..n {
+            let u = (i % 1310) as f32 * 0.00071 + (i / 1310) as f32 * 0.0003;
+            let v = (i / 1310) as f32 * 0.00093 + 0.1;
+            let s = tex.sample_lod(u, v, lod, bil);
+            acc = acc.wrapping_add(s[0] as u32 + s[3] as u32);
+        }
+        println!("TEXBENCH {label}: {:.1} ns per sample ({acc})", t.elapsed().as_nanos() as f64 / n as f64);
+    }
+}
+
+/// Floors / ceilings from before 0.2.4 (stopping at the wall center line)
+/// are refit to the walls' outer edge when a map opens; new ones are left alone.
+#[test]
+fn old_building_slabs_are_refit() {
+    let s = crate::settings::Settings { layout_ceiling: true, wall_thickness: 0.5, ..Default::default() };
+    // the slightly crooked outline from a real map
+    let pts = [Vec3::new(-27.79, 0.0, -27.71), Vec3::new(27.79, 0.0, -27.71), Vec3::new(28.33, 0.0, 27.61), Vec3::new(-29.04, 0.0, 28.41)];
+    let mut map = Map::default();
+    let f = map.add_folder("Building 1", None);
+    for mut o in crate::building::house_objects(&pts, &s, 0.0, None, None) {
+        o.folder = Some(f);
+        map.add(o);
+    }
+    assert_eq!(crate::trim::refit_old_slabs(&mut map), 0, "new buildings are already right");
+    // make them like the old ones: slabs on the center line
+    for name in ["Floor", "Ceiling"] {
+        let old = map.objects.iter().find(|o| o.name == name).unwrap().clone();
+        let y = if name == "Floor" { -s.floor_thickness } else { s.wall_height };
+        let mut o = crate::building::slab(&pts, y, s.floor_thickness, old.color, old.material);
+        o.name = name.into();
+        o.folder = Some(f);
+        let id = old.id;
+        map.remove(&[id]);
+        map.add(o);
+    }
+    assert_eq!(crate::trim::refit_old_slabs(&mut map), 2);
+    let outer = crate::building::inset_outline(&pts, -0.25);
+    for name in ["Floor", "Ceiling"] {
+        let o = map.objects.iter().find(|o| o.name == name).unwrap();
+        let m = crate::mesh::world_mesh(o, &[], &mut ModelCache::default());
+        for c in &outer {
+            assert!(m.pos.iter().any(|p| (Vec3::new(p.x, 0.0, p.z) - Vec3::new(c.x, 0.0, c.z)).length() < 1e-3), "{name} reaches the outer corner {c}");
+        }
+        let (lo, hi) = m.pos.iter().fold((f32::MAX, f32::MIN), |(a, b), p| (a.min(p.y), b.max(p.y)));
+        let want = if name == "Floor" { -s.floor_thickness } else { s.wall_height };
+        assert!((lo - want).abs() < 1e-4 && (hi - lo - s.floor_thickness).abs() < 1e-4, "{name} keeps its height: {lo}..{hi}");
+    }
+    assert_eq!(crate::trim::refit_old_slabs(&mut map), 0, "only once");
+}
+
+/// A huge ground reaching behind the camera: its far edge must be a clean
+/// straight line (it used to come out in jagged steps on the horizon).
+#[test]
+fn far_ground_edge_is_straight() {
+    use crate::view3d::{Camera, RenderOpts, Renderer};
+    let mut map = Map::default();
+    map.add(Object::brush(Shape::Box, Vec3::new(400.0, 1.0, 400.0), Vec3::new(0.0, -0.5, 0.0), [120, 160, 90], Material::Grass));
+    let scene = crate::mesh::build_scene(&map, &mut ModelCache::default());
+    let ctx = eframe::egui::Context::default();
+    let rect = eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::vec2(1310.0, 890.0));
+    for (eye, at) in [(Vec3::new(0.0, 2.0, 190.0), Vec3::new(0.0, 1.9, -200.0)), (Vec3::new(30.0, 3.0, 150.0), Vec3::new(30.0, 2.8, -200.0))] {
+        let cam = Camera::looking_at(eye, at);
+        let opts = RenderOpts { fov: 70.0, grid: 1.0, plane_y: 0.0, show_grid: false, outlines: false, bg: [0, 0, 0], scale: 1.0, filter: true, lighting: Default::default() };
+        let mut r = Renderer::default();
+        r.render(&ctx, rect, &cam, &opts, &scene, &[], &HashMap::new(), &mut crate::texture::TexCache::default());
+        let (w, h, px) = r.pixels();
+        // columns under the far edge itself (it spans about ±320 px around the middle)
+        let tops: Vec<usize> = (w / 2 - 250..w / 2 + 250)
+            .step_by(3)
+            .map(|x| (0..h).find(|y| px[(y * w + x) * 4 + 1] > 0).unwrap_or(h))
+            .collect();
+        let (lo, hi) = (*tops.iter().min().unwrap(), *tops.iter().max().unwrap());
+        assert!(hi < h, "the ground shows");
+        assert!(hi - lo <= 1, "far edge rows {lo}..{hi} (should be one straight line)");
     }
 }

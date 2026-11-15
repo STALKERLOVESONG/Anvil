@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.5
+
+- **3D view much faster again:**
+  - It isn't redrawn at all when nothing in it changed (clicking panels, typing, editing
+    in the Inspector).
+  - While the camera moves, a slow view draws at lower resolution and sharpens the
+    moment it stops (Settings > *Faster while moving*).
+  - Fog is added while drawing instead of in an extra pass over the screen.
+  - Near objects are drawn first, so hidden pixels are skipped.
+  - Faster texture sampling, and the finished frame reaches the screen about 5x faster.
+  - On a real map, a typical view went from about 40 ms to 26 ms per frame at full
+    resolution.
+- **Fixed:** jagged steps along the horizon where a big ground ended. The coverage math
+  now runs in double precision when a triangle reaches behind the camera.
+- **Fixed:** detailed props got dark wireframe outlines in the 3D view; now only
+  selected ones do.
+- **Older buildings** (made before 0.2.4) get their floor and ceiling refit to the
+  outside of the walls when the map is opened. Save to keep it.
+
 ## 0.2.4
 
 - **Much faster 3D view on big maps.** A map with 150 detailed props (3.3 million

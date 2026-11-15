@@ -57,31 +57,65 @@ impl TexImage {
             let m = &self.mips[level - 1];
             (m.0, m.1, &m.2)
         };
-        let fu = u - u.floor();
-        let fv = v - v.floor();
+        // one bounds check per texel, read as a whole pixel
+        let texel = |i: usize| -> [u8; 4] {
+            match d.get(i..i + 4) {
+                Some(s) => [s[0], s[1], s[2], s[3]],
+                None => [0; 4],
+            }
+        };
+        let fu = u - ffloor(u);
+        let fv = v - ffloor(v);
         if !bilinear || (w == 1 && h == 1) {
             let x = ((fu * w as f32) as usize).min(w - 1);
             let y = ((fv * h as f32) as usize).min(h - 1);
-            let i = (y * w + x) * 4;
-            return [d[i], d[i + 1], d[i + 2], d[i + 3]];
+            return texel((y * w + x) * 4);
         }
         let x = fu * w as f32 - 0.5;
         let y = fv * h as f32 - 0.5;
-        let (xf, yf) = (x.floor(), y.floor());
-        let (tx, ty) = (x - xf, y - yf);
-        let wrap = |a: i64, n: usize| a.rem_euclid(n as i64) as usize;
-        let (x0, x1) = (wrap(xf as i64, w), wrap(xf as i64 + 1, w));
-        let (y0, y1) = (wrap(yf as i64, h), wrap(yf as i64 + 1, h));
+        let (xf, yf) = (ffloor(x), ffloor(y));
+        // 8-bit fixed point weights: integer math instead of 16 float blends
+        let (tx, ty) = (((x - xf) * 256.0) as u32, ((y - yf) * 256.0) as u32);
+        // xf is in -1..=w-1 here, so wrapping needs no division
+        let (xi, yi) = (xf as i64, yf as i64);
+        let x0 = if xi < 0 { w - 1 } else { (xi as usize).min(w - 1) };
+        let x1 = if xi + 1 >= w as i64 { 0 } else { (xi + 1) as usize };
+        let y0 = if yi < 0 { h - 1 } else { (yi as usize).min(h - 1) };
+        let y1 = if yi + 1 >= h as i64 { 0 } else { (yi + 1) as usize };
         let p = |x: usize, y: usize| (y * w + x) * 4;
-        let (a, b, c, e) = (p(x0, y0), p(x1, y0), p(x0, y1), p(x1, y1));
+        let (a, b, c, e) = (texel(p(x0, y0)), texel(p(x1, y0)), texel(p(x0, y1)), texel(p(x1, y1)));
+        let (ix, iy) = (256 - tx, 256 - ty);
         let mut out = [0u8; 4];
         for ch in 0..4 {
-            let top = d[a + ch] as f32 * (1.0 - tx) + d[b + ch] as f32 * tx;
-            let bot = d[c + ch] as f32 * (1.0 - tx) + d[e + ch] as f32 * tx;
-            out[ch] = (top * (1.0 - ty) + bot * ty + 0.5) as u8;
+            let top = a[ch] as u32 * ix + b[ch] as u32 * tx;
+            let bot = c[ch] as u32 * ix + e[ch] as u32 * tx;
+            out[ch] = ((top * iy + bot * ty + 32768) >> 16) as u8;
         }
         out
     }
+}
+
+/// floor() without a library call (plain builds have no SSE4.1 rounding
+/// instruction, and this runs several times per pixel). For |x| < 2^31.
+#[inline(always)]
+pub fn ffloor(x: f32) -> f32 {
+    let t = x as i32 as f32;
+    if t > x {
+        t - 1.0
+    } else {
+        t
+    }
+}
+
+/// Mip level for a squared texel footprint: floor(0.5 * log2(rho2)), read
+/// straight from the float's exponent.
+#[inline(always)]
+pub fn mip_level(rho2: f32) -> usize {
+    if rho2 <= 1.0 || !rho2.is_finite() {
+        return 0;
+    }
+    let e = ((rho2.to_bits() >> 23) & 0xff) as i32 - 127;
+    (e.max(0) >> 1) as usize
 }
 
 /// Images keyed by path, downscaled to the preview quality limit.
@@ -90,11 +124,14 @@ pub struct TexCache {
     max_dim: u32,
     /// Team Create: map path -> local copy (None = not downloaded yet, don't open).
     alias: HashMap<String, Option<String>>,
+    /// Bumped whenever a cached image may have changed (so a finished 3D
+    /// frame isn't reused with old textures).
+    pub version: u64,
 }
 
 impl Default for TexCache {
     fn default() -> Self {
-        TexCache { items: HashMap::new(), max_dim: 1024, alias: HashMap::new() }
+        TexCache { items: HashMap::new(), max_dim: 1024, alias: HashMap::new(), version: 0 }
     }
 }
 
@@ -117,12 +154,14 @@ impl TexCache {
 
     pub fn forget(&mut self, path: &str) {
         self.items.remove(path);
+        self.version += 1;
     }
 
     /// Makes `path` load from `real` instead (None: never open `path`).
     pub fn alias(&mut self, path: &str, real: Option<String>) {
         self.items.remove(path);
         self.alias.insert(path.to_string(), real);
+        self.version += 1;
     }
 
     /// Changes the preview resolution limit (reloads everything when it changes).
@@ -131,6 +170,7 @@ impl TexCache {
         if max_dim != self.max_dim {
             self.max_dim = max_dim;
             self.items.clear();
+            self.version += 1;
         }
     }
 }

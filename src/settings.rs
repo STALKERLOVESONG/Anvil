@@ -206,6 +206,8 @@ pub struct Settings {
     pub show_grid_3d: bool,
     pub outlines_3d: bool,
     pub render_scale: f32,
+    /// Draw the 3D view at lower resolution while the camera moves (if it's slow).
+    pub fast_motion: bool,
     /// Largest texture size used by the 3D preview (exports always use the originals).
     pub preview_texture_size: u32,
     pub texture_filtering: bool,
@@ -313,6 +315,7 @@ impl Default for Settings {
             show_grid_3d: true,
             outlines_3d: true,
             render_scale: 1.0,
+            fast_motion: true,
             preview_texture_size: 1024,
             texture_filtering: true,
             bg_2d: [24, 25, 28],
