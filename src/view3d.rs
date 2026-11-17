@@ -1113,14 +1113,15 @@ fn post_light(color: &mut [u8], depth: &[f32], w: usize, rows: usize, lc: &LitCt
 // Picking
 // ---------------------------------------------------------------------------
 
-pub fn ray_aabb(o: Vec3, d: Vec3, mn: Vec3, mx: Vec3, tmax: f32) -> bool {
+/// Where the ray enters the box (0 if it starts inside), if it hits it before `tmax`.
+pub fn ray_aabb_entry(o: Vec3, d: Vec3, mn: Vec3, mx: Vec3, tmax: f32) -> Option<f32> {
     let (mn, mx) = (mn - Vec3::splat(1e-3), mx + Vec3::splat(1e-3));
     let mut t0 = 0.0f32;
     let mut t1 = tmax;
     for i in 0..3 {
         if d[i].abs() < 1e-9 {
             if o[i] < mn[i] || o[i] > mx[i] {
-                return false;
+                return None;
             }
             continue;
         }
@@ -1132,10 +1133,10 @@ pub fn ray_aabb(o: Vec3, d: Vec3, mn: Vec3, mx: Vec3, tmax: f32) -> bool {
         t0 = t0.max(a);
         t1 = t1.min(b);
         if t0 > t1 {
-            return false;
+            return None;
         }
     }
-    true
+    Some(t0)
 }
 
 pub fn ray_tri(o: Vec3, d: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
@@ -1173,13 +1174,13 @@ pub struct RayHit {
 /// Nearest object hit by a ray. `skip` filters objects out.
 pub fn pick_ray_where(scene: &[Arc<WorldMesh>], o: Vec3, d: Vec3, skip: impl Fn(&WorldMesh) -> bool) -> Option<RayHit> {
     let mut best: Option<RayHit> = None;
-    for wm in scene {
-        if skip(wm.as_ref()) {
-            continue;
-        }
-        let tmax = best.map(|b| b.t).unwrap_or(f32::MAX);
-        if !ray_aabb(o, d, wm.min, wm.max, tmax) {
-            continue;
+    // nearest boxes first: once one starts beyond the best hit, nothing
+    // further can be nearer (big maps: most objects are never opened)
+    let mut order: Vec<(f32, &Arc<WorldMesh>)> = scene.iter().filter(|wm| !skip(wm.as_ref())).filter_map(|wm| ray_aabb_entry(o, d, wm.min, wm.max, f32::MAX).map(|t| (t, wm))).collect();
+    order.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (entry, wm) in order {
+        if best.is_some_and(|b| entry > b.t) {
+            break;
         }
         for (ti, t) in wm.mesh.tris.iter().enumerate() {
             let (a, b, c) = (wm.pos[t[0] as usize], wm.pos[t[1] as usize], wm.pos[t[2] as usize]);

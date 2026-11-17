@@ -24,6 +24,10 @@ pub(crate) struct Ghost {
     pub mesh: Option<Arc<WorldMesh>>,
     key: String,
     pub touched: bool,
+    /// Where the mesh was built, and how far the mouse has moved it since:
+    /// the ghost is rebuilt only when what's placed or its turn changes.
+    base: Vec3,
+    pub offset: Vec3,
 }
 
 fn snap(v: f32, g: f32) -> f32 {
@@ -125,11 +129,14 @@ impl AnvilApp {
             return;
         }
         self.ghost.touched = true;
-        let key = format!("{at:?}|{on_surface}|{:?}|{:?}|{:?}|{:?}", self.tool, self.active_model, self.active_preset, self.brush_shape);
+        let key = format!("{on_surface}|{:?}|{:?}|{:?}|{:?}|{}", self.tool, self.active_model, self.active_preset, self.brush_shape, self.place_yaw);
         if key == self.ghost.key && self.ghost.mesh.is_some() {
+            self.ghost.offset = at - self.ghost.base;
             return;
         }
         self.ghost.key = key;
+        self.ghost.base = at;
+        self.ghost.offset = Vec3::ZERO;
         self.ghost.mesh = self.placement(at, on_surface).ok().map(|o| Arc::new(world_mesh(&o, &self.map.textures, &mut self.models)));
     }
 
@@ -143,7 +150,8 @@ impl AnvilApp {
     }
 
         /// Ghost / opening hover handling for the 3D view (call with the hover position).
-    pub(crate) fn hover_3d(&mut self, rect: Rect, scene: &[Arc<WorldMesh>], hover: Option<Pos2>, free: bool) {
+    /// `under`: what's under the mouse (already picked this frame).
+    pub(crate) fn hover_3d(&mut self, rect: Rect, under: Option<Vec3>, hover: Option<Pos2>, free: bool) {
         let Some(h) = hover else { return };
         let fov = self.settings.fov;
         let (o, d) = self.cam.ray(rect, fov, h);
@@ -156,8 +164,7 @@ impl AnvilApp {
         }
         if self.is_ghost_tool() && matches!(self.drag, crate::app::Drag::None) {
             let g = self.snap_step();
-            let pt = pick_ray(scene, o, d).map(|h| h.point).or_else(|| ray_plane(o, d, self.work_y));
-            if let Some(pt) = pt {
+            if let Some(pt) = under {
                 self.update_ghost(Vec3::new(snap(pt.x, g), pt.y, snap(pt.z, g)), true);
             }
         }
@@ -284,13 +291,14 @@ impl AnvilApp {
 
     fn paint_ghost(&self, mut seg: impl FnMut(Vec3, Vec3)) {
         let Some(g) = &self.ghost.mesh else { return };
+        let off = self.ghost.offset;
         if g.mesh.edges.is_empty() || g.mesh.edges.len() > 4000 {
-            for (a, b) in box_edges(corners(g.min, g.max, |p| p)) {
+            for (a, b) in box_edges(corners(g.min, g.max, |p| p + off)) {
                 seg(a, b);
             }
         } else {
             for e in &g.mesh.edges {
-                seg(g.pos[e[0] as usize], g.pos[e[1] as usize]);
+                seg(g.pos[e[0] as usize] + off, g.pos[e[1] as usize] + off);
             }
         }
     }

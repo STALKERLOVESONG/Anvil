@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod autosave;
 mod branding;
 mod blender_export;
 mod building;
@@ -24,6 +25,7 @@ mod map;
 mod mesh;
 mod mesh_csg;
 mod mesh_openings;
+mod play_export;
 mod playtest;
 mod plugin_panels;
 mod plugin_web;

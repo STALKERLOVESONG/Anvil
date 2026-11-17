@@ -817,7 +817,7 @@ impl AnvilApp {
         }
         let mut act: Option<(String, bool)> = None;
         egui::Window::new("New or changed plugins").collapsible(false).resizable(true).default_width(520.0).show(ctx, |ui| {
-            ui.label(RichText::new("These plugin scripts are new or were changed since you last allowed them. Plugins can change your map, but can't touch files, the network or other programs. Only allow ones you trust.").small());
+            ui.label(RichText::new("These plugin scripts are new or were changed since you last allowed them. Plugins can change your map, but can't touch files, the network or other programs, except: websites a plugin lists under hosts, and (with programs: true) folders you pick for it and programs in them, after asking you. Only allow ones you trust.").small());
             for p in &self.plugins.pending {
                 ui.separator();
                 ui.horizontal(|ui| {

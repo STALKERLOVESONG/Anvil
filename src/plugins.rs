@@ -148,6 +148,9 @@ pub struct Plugin {
     pub kind: PluginKind,
     /// Websites (https hosts) this plugin may talk to, from its info().
     pub hosts: Vec<String>,
+    /// Its info() says `programs: true`: it may ask you to pick folders and
+    /// start programs inside them (asking you first, each new program).
+    pub programs: bool,
     ast: AST,
 }
 
@@ -172,6 +175,8 @@ struct Ctx {
     gizmo_local: bool,
     hosts: Vec<String>,
     imports: Vec<(String, String)>,
+    programs: bool,
+    plugin_name: String,
 }
 
 /// What a plugin call changed.
@@ -539,6 +544,82 @@ fn build_engine(ctx: &Rc<RefCell<Ctx>>) -> Engine {
             c.borrow_mut().imports.push((path.to_string(), name.chars().take(80).collect()));
             true
         });
+        // folders you pick and programs you allow (only `programs: true` plugins)
+        fn refuse(c: &std::rc::Rc<std::cell::RefCell<Ctx>>, what: &str) -> bool {
+            let mut x = c.borrow_mut();
+            if x.programs {
+                return false;
+            }
+            x.log.push(format!("{what}: this plugin's info() doesn't say programs: true"));
+            true
+        }
+        let c = ctx.clone();
+        e.register_fn("pick_folder", move |title: &str| -> String {
+            if refuse(&c, "pick_folder") {
+                return String::new();
+            }
+            let plugin = c.borrow().plugin.clone();
+            w::pick_folder(&plugin, title)
+        });
+        let c = ctx.clone();
+        e.register_fn("granted_folders", move || -> Array { w::granted_folders(&c.borrow().plugin).into_iter().map(Dynamic::from).collect() });
+        let c = ctx.clone();
+        e.register_fn("exists", move |path: &str| -> bool { w::exists(&c.borrow().plugin, path) });
+        fn run(c: &std::rc::Rc<std::cell::RefCell<Ctx>>, exe: &str, args: Array, env: RMap, cwd: &str) -> bool {
+            if refuse(c, "run_program") {
+                return false;
+            }
+            let (plugin, name) = {
+                let x = c.borrow();
+                (x.plugin.clone(), x.plugin_name.clone())
+            };
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let env: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            match crate::plugin_web::run_program(&plugin, &name, exe, &args, &env, cwd) {
+                Ok(()) => true,
+                Err(err) => {
+                    c.borrow_mut().log.push(format!("run_program: {err}"));
+                    false
+                }
+            }
+        }
+        let c = ctx.clone();
+        e.register_fn("run_program", move |exe: &str, args: Array| -> bool { run(&c, exe, args, RMap::new(), "") });
+        let c = ctx.clone();
+        e.register_fn("run_program", move |exe: &str, args: Array, env: RMap| -> bool { run(&c, exe, args, env, "") });
+        let c = ctx.clone();
+        e.register_fn("run_program", move |exe: &str, args: Array, env: RMap, cwd: &str| -> bool { run(&c, exe, args, env, cwd) });
+        // the map written into the plugin's own folder, for an outside playtest
+        let c = ctx.clone();
+        e.register_fn("export_scene", move |name: &str, meters: f64| -> String {
+            let mut guard = c.borrow_mut();
+            let x = &mut *guard;
+            let dir = w::plugin_dir(&x.plugin);
+            let path = dir.join(w::safe_name(name));
+            let bytes = crate::blender_export::scene_glb_with(&x.map, &mut x.models, meters as f32, true);
+            match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, bytes)) {
+                Ok(()) => path.to_string_lossy().to_string(),
+                Err(err) => {
+                    x.log.push(format!("export_scene: {err}"));
+                    String::new()
+                }
+            }
+        });
+        let c = ctx.clone();
+        e.register_fn("export_boxes", move |name: &str, meters: f64, props: bool| -> String {
+            let mut guard = c.borrow_mut();
+            let x = &mut *guard;
+            let dir = w::plugin_dir(&x.plugin);
+            let path = dir.join(w::safe_name(name));
+            let bytes = crate::play_export::collision_gltf(&x.map, &mut x.models, meters as f32, props);
+            match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, bytes)) {
+                Ok(()) => path.to_string_lossy().to_string(),
+                Err(err) => {
+                    x.log.push(format!("export_boxes: {err}"));
+                    String::new()
+                }
+            }
+        });
         let c = ctx.clone();
         e.register_fn("secret_get", move |name: &str| -> String { w::secret_get(&c.borrow().plugin, name) });
         let c = ctx.clone();
@@ -755,7 +836,8 @@ impl PluginHost {
             .map(|a| a.iter().map(|x| x.to_string().to_ascii_lowercase()).filter(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')).take(16).collect())
             .unwrap_or_default();
         let name = if get("name").is_empty() { file.clone() } else { get("name") };
-        Ok(Plugin { file, name, description: get("description"), kind, hosts, ast })
+        let programs = info.get("programs").and_then(|v| v.as_bool().ok()).unwrap_or(false);
+        Ok(Plugin { file, name, description: get("description"), kind, hosts, programs, ast })
     }
 
     pub fn new_plugin_file(&mut self) -> Result<PathBuf, String> {
@@ -815,6 +897,8 @@ impl PluginHost {
         c.status = None;
         c.plugin = self.plugins.get(idx).map(|p| p.file.clone()).unwrap_or_default();
         c.hosts = self.plugins.get(idx).map(|p| p.hosts.clone()).unwrap_or_default();
+        c.programs = self.plugins.get(idx).is_some_and(|p| p.programs);
+        c.plugin_name = self.plugins.get(idx).map(|p| p.name.clone()).unwrap_or_default();
         c.imports.clear();
     }
 
@@ -834,7 +918,8 @@ impl PluginHost {
 
     /// A button / input in a panel plugin's window was used.
     pub fn panel_event(&mut self, idx: usize, map: &Map, models: &ModelCache, grid: f32, id: &str, value: &str) -> Outcome {
-        self.prepare_with(idx, map, models, &[], grid, HashMap::new(), true);
+        // the whole map: a button may export it (the per-frame panel() stays light)
+        self.prepare_with(idx, map, models, &[], grid, HashMap::new(), false);
         let r = self.call(idx, "panel_event", (id.to_string(), value.to_string()));
         let mut out = self.finish();
         if let Err(e) = r {
@@ -863,6 +948,23 @@ impl PluginHost {
         let mut scope = Scope::new();
         let r = self.engine.call_fn::<Dynamic>(&mut scope, &p.ast, func, args);
         r.map_err(|e| format!("{} {func}(): {e}", p.name))
+    }
+
+    /// The first loaded plugin that runs playtests (`fn playtest()`).
+    pub fn playtest_plugin(&self) -> Option<usize> {
+        (0..self.plugins.len()).find(|i| self.has_fn(*i, "playtest"))
+    }
+
+    /// Runs a plugin's `playtest()` with the whole map.
+    pub fn playtest(&mut self, idx: usize, map: &Map, models: &ModelCache, grid: f32) -> Outcome {
+        self.prepare_with(idx, map, models, &[], grid, HashMap::new(), false);
+        let r = self.call(idx, "playtest", ());
+        let mut out = self.finish();
+        if let Err(e) = r {
+            self.log.push(e.clone());
+            out.status = Some(e);
+        }
+        out
     }
 
     pub fn run_command(&mut self, idx: usize, map: &Map, models: &ModelCache, sel: &[u64], grid: f32, bounds: HashMap<u64, (Vec3, Vec3)>) -> Outcome {

@@ -3580,3 +3580,257 @@ fn far_ground_edge_is_straight() {
         assert!(hi - lo <= 1, "far edge rows {lo}..{hi} (should be one straight line)");
     }
 }
+
+#[test]
+fn object_list_shift_and_ctrl_select() {
+    use crate::app::outliner_pick;
+    let order = [10u64, 11, 12, 13, 14, 15, 16];
+    // plain click: just that one
+    let s = outliner_pick(&[10, 11], &order, None, 12, false, false);
+    assert_eq!(s, vec![12]);
+    // Shift adds one at a time, and removes when clicked again
+    let s = outliner_pick(&s, &order, Some(12), 15, true, false);
+    assert_eq!(s, vec![12, 15]);
+    let s = outliner_pick(&s, &order, Some(15), 12, true, false);
+    assert_eq!(s, vec![15]);
+    // Ctrl: everything between the last clicked and this one (either way round)
+    let s = outliner_pick(&[11], &order, Some(11), 14, false, true);
+    assert_eq!(s, vec![11, 12, 13, 14]);
+    let s = outliner_pick(&s, &order, Some(14), 16, false, true);
+    assert_eq!(s, vec![11, 12, 13, 14, 15, 16]);
+    let s = outliner_pick(&[], &order, Some(16), 13, false, true);
+    assert_eq!(s, vec![13, 14, 15, 16]);
+    // Ctrl with nothing clicked before: just adds it
+    assert_eq!(outliner_pick(&[10], &order, None, 13, false, true), vec![10, 13]);
+}
+
+/// Writes what the TRP playtest plugin hands TRP for a real map (ANVIL_MAP)
+/// into ANVIL_PLAY_OUT: anvil_scene.glb (PNG pictures only) and anvil_level.gltf.
+#[test]
+#[ignore]
+fn export_for_trp() {
+    let (Ok(path), Ok(out)) = (std::env::var("ANVIL_MAP"), std::env::var("ANVIL_PLAY_OUT")) else { return };
+    let map = Map::load(std::path::Path::new(&path)).unwrap();
+    let mut models = ModelCache::default();
+    let out = std::path::PathBuf::from(out);
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("anvil_scene.glb"), crate::blender_export::scene_glb_with(&map, &mut models, 0.28, true)).unwrap();
+    std::fs::write(out.join("anvil_level.gltf"), crate::play_export::collision_gltf(&map, &mut models, 0.28, true)).unwrap();
+    let boxes = crate::play_export::solid_boxes(&map, &mut models, 0.28, true);
+    println!("TRP export: {} boxes, start {:?}", boxes.len(), crate::play_export::start(&map, 0.28));
+}
+
+#[test]
+fn play_export_boxes_keep_doors_open() {
+    let mut map = Map::default();
+    // a wall with a door cut through it, a wedge ramp, stairs and a prop-like mesh
+    let mut wall = Object::brush(Shape::Box, Vec3::new(10.0, 8.0, 1.0), Vec3::new(0.0, 4.0, 0.0), [200; 3], Material::Brick);
+    if let Kind::Brush { holes, .. } = &mut wall.kind {
+        holes.push(crate::map::Hole { min: Vec3::new(-1.5, -4.1, -0.6), max: Vec3::new(1.5, 2.0, 0.6) });
+    }
+    wall.rot.y = 30.0;
+    map.add(wall.clone());
+    map.add(Object::brush(Shape::Wedge, Vec3::new(4.0, 2.0, 8.0), Vec3::new(20.0, 1.0, 0.0), [200; 3], Material::Concrete));
+    map.add(Object::new(Kind::Spawn { size: Vec3::new(4.0, 0.2, 4.0) }, Vec3::new(0.0, 0.1, 10.0), [255; 3], Material::Plastic));
+    let mut models = ModelCache::default();
+    let boxes = crate::play_export::solid_boxes(&map, &mut models, 0.28, true);
+    let wall_boxes: Vec<_> = boxes.iter().filter(|b| b.surface == "Concrete" && (b.yaw - 30f32.to_radians()).abs() < 1e-4).collect();
+    assert!(wall_boxes.len() >= 3, "the wall is split around its door: {wall_boxes:?}");
+    // nothing solid where the door is (its middle, 1 unit up)
+    let door = wall.to_world(Vec3::new(0.0, -3.0, 0.0)) * 0.28;
+    for b in &wall_boxes {
+        let local = glam::Quat::from_rotation_y(-b.yaw) * (door - b.centre);
+        assert!(local.abs().cmpgt(b.size * 0.5).any(), "a box fills the doorway: {b:?}");
+    }
+    // the ramp is steps that climb toward +Z
+    let steps: Vec<_> = boxes.iter().filter(|b| (b.centre.x - 20.0 * 0.28).abs() < 1e-3).collect();
+    assert!(steps.len() >= 3);
+    assert!(steps.windows(2).all(|w| w[1].centre.z > w[0].centre.z && w[1].size.y > w[0].size.y), "{steps:?}");
+    // the start stands on the spawn pad
+    let (feet, _) = crate::play_export::start(&map, 0.28);
+    assert!((feet - Vec3::new(0.0, 0.2, 10.0) * 0.28).length() < 1e-4, "{feet}");
+    // and the file is glTF TRP's reader takes: boxes about unit cubes, the start node
+    let gltf: serde_json::Value = serde_json::from_slice(&crate::play_export::collision_gltf(&map, &mut models, 0.28, true)).unwrap();
+    let nodes = gltf["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), boxes.len() + 1);
+    assert!(nodes.iter().any(|n| n["name"] == "start anvil"));
+    assert_eq!(gltf["accessors"][0]["min"], serde_json::json!([-0.5, -0.5, -0.5]));
+}
+
+/// Plugins can only pick folders / start programs if their info() says
+/// `programs: true`, and then only .exe files inside folders the user picked.
+#[test]
+fn plugin_programs_are_fenced() {
+    use crate::plugin_web::*;
+    let root = out_dir("programs_fence");
+    let picked = root.join("picked");
+    std::fs::create_dir_all(picked.join("bin")).unwrap();
+    std::fs::write(picked.join("bin").join("game.exe"), b"MZ fake").unwrap();
+    std::fs::write(picked.join("bin").join("run.bat"), b"echo hi").unwrap();
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("other.exe"), b"MZ fake").unwrap();
+    let plugin = "fence_test.rhai";
+    forget_grants(plugin);
+    grant_folder(plugin, &picked).unwrap();
+    let exe = picked.join("bin").join("game.exe").to_string_lossy().to_string();
+    // inside a picked folder: fine
+    assert!(check_run(plugin, &exe, &["--x".into()], &[("SPT_DIR".into(), r"C:\games".into())], "").is_ok());
+    // not an .exe, outside the picked folders, the plugin's own folder, a share
+    assert!(check_run(plugin, &picked.join("bin").join("run.bat").to_string_lossy(), &[], &[], "").is_err());
+    assert!(check_run(plugin, &elsewhere.join("other.exe").to_string_lossy(), &[], &[], "").is_err());
+    std::fs::create_dir_all(plugin_dir(plugin)).unwrap();
+    std::fs::write(plugin_dir(plugin).join("own.exe"), b"MZ").unwrap();
+    grant_folder(plugin, &plugin_dir(plugin)).unwrap();
+    assert!(check_run(plugin, &plugin_dir(plugin).join("own.exe").to_string_lossy(), &[], &[], "").is_err(), "not something it downloaded into its own folder");
+    assert!(check_run(plugin, r"\server\share\x.exe", &[], &[], "").is_err());
+    // environment: no PATH-like variables, plain names only
+    for bad in ["PATH", "ComSpec", "PATHEXT", "A B", "1X", ""] {
+        assert!(check_run(plugin, &exe, &[], &[(bad.into(), "x".into())], "").is_err(), "{bad}");
+    }
+    // the working folder must be a picked one too
+    assert!(check_run(plugin, &exe, &[], &[], &elsewhere.to_string_lossy()).is_err());
+    // never asked = never started (in tests the Yes/No box answers no)
+    assert_eq!(run_program(plugin, "Fence test", &exe, &[], &[], ""), Err("you said no".into()));
+    // and a plugin that didn't ask for programs can't use any of it
+    let mut host = crate::plugins::PluginHost::new();
+    std::fs::write(host.dir.join("no_programs_test.rhai"), "fn info() { #{ name: \"np\", kind: \"panel\" } }\nfn panel() { [] }\nfn panel_event(id, v) { pick_folder(\"x\"); run_program(\"nothing.exe\", []); }\n").unwrap();
+    host.approve(&crate::plugins::trust_key("no_programs_test.rhai", &std::fs::read(host.dir.join("no_programs_test.rhai")).unwrap()));
+    host.reload();
+    let idx = host.plugins.iter().position(|p| p.file == "no_programs_test.rhai").expect("loads");
+    let log_start = host.log.len();
+    host.panel_event(idx, &Map::default(), &ModelCache::default(), 1.0, "go", "");
+    let log = host.log[log_start..].join("\n");
+    assert!(log.contains("pick_folder: this plugin's info() doesn't say programs: true") && log.contains("run_program: this plugin's info() doesn't say programs: true"), "{log}");
+    let _ = std::fs::remove_file(host.dir.join("no_programs_test.rhai"));
+}
+
+/// The TRP playtest plugin (ANVIL_TRP_PLUGIN = its .rhai) end to end with a
+/// stand-in TRP folder: F5 writes the map's look and boxes into its folder
+/// and asks to start trp.exe with them (in tests the answer is no, so
+/// nothing runs).
+#[test]
+#[ignore]
+fn trp_playtest_plugin_flow() {
+    let Ok(src) = std::env::var("ANVIL_TRP_PLUGIN") else { return };
+    crate::plugin_web::forget_grants("trp_playtest.rhai");
+    let mut host = crate::plugins::PluginHost::new();
+    let bytes = std::fs::read(&src).unwrap();
+    std::fs::write(host.dir.join("trp_playtest.rhai"), &bytes).unwrap();
+    host.approve(&crate::plugins::trust_key("trp_playtest.rhai", &bytes));
+    host.reload();
+    let idx = host.plugins.iter().position(|p| p.file == "trp_playtest.rhai").expect("the TRP plugin loads");
+    assert!(host.plugins[idx].programs);
+    assert_eq!(host.playtest_plugin(), Some(idx), "F5 goes to it");
+    let mut map = Map::default();
+    map.add(Object::brush(Shape::Box, Vec3::new(20.0, 1.0, 20.0), Vec3::new(0.0, -0.5, 0.0), [120; 3], Material::Concrete));
+    map.add(Object::new(Kind::Spawn { size: Vec3::new(4.0, 0.2, 4.0) }, Vec3::new(2.0, 0.1, 3.0), [255; 3], Material::Plastic));
+    // before a TRP folder is picked: it says so
+    let out = host.playtest(idx, &map, &ModelCache::default(), 1.0);
+    assert!(out.status.as_deref().unwrap_or("").contains("pick your TRP folder"), "{:?}", out.status);
+    // a TRP folder, picked: ANVIL_TRP_DIR (e.g. an unzipped bundle's), else a stand-in
+    let fake = match std::env::var("ANVIL_TRP_DIR") {
+        Ok(d) => std::path::PathBuf::from(d),
+        Err(_) => {
+            let fake = out_dir("fake_trp");
+            let exe = fake.join("TRP").join("target").join("release");
+            std::fs::create_dir_all(&exe).unwrap();
+            std::fs::write(exe.join("trp.exe"), b"MZ stand-in").unwrap();
+            fake
+        }
+    };
+    crate::plugin_web::grant_folder("trp_playtest.rhai", &fake).unwrap();
+    let (w, _) = host.panel(idx, &map, &ModelCache::default(), 1.0);
+    assert!(format!("{w:?}").contains("trp.exe"), "the panel shows TRP found: {w:?}");
+    let log_start = host.log.len();
+    let out = host.playtest(idx, &map, &ModelCache::default(), 1.0);
+    let log = host.log[log_start..].join("\n");
+    assert!(log.contains("run_program: you said no"), "it got as far as asking to start trp.exe: {log} / {:?}", out.status);
+    let dir = crate::plugin_web::plugin_dir("trp_playtest.rhai");
+    let level: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("anvil_level.gltf")).unwrap()).unwrap();
+    assert!(level["nodes"].as_array().unwrap().iter().any(|n| n["name"] == "start anvil"));
+    let scene = std::fs::read(dir.join("anvil_scene.glb")).unwrap();
+    assert!(scene.starts_with(b"glTF"));
+    let _ = std::fs::remove_file(host.dir.join("trp_playtest.rhai"));
+}
+
+/// The nearest-first pick finds exactly what testing every object would.
+#[test]
+fn nearest_first_pick_matches_brute_force() {
+    let mut map = Map::default();
+    let mut seed = 7u32;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) as f32 / 16_777_216.0
+    };
+    for _ in 0..300 {
+        let p = Vec3::new(rnd() * 200.0 - 100.0, rnd() * 20.0, rnd() * 200.0 - 100.0);
+        let s = Vec3::new(1.0 + rnd() * 8.0, 1.0 + rnd() * 8.0, 1.0 + rnd() * 8.0);
+        let mut o = Object::brush(if rnd() > 0.5 { Shape::Box } else { Shape::Sphere }, s, p, [200; 3], Material::Plastic);
+        o.rot.y = rnd() * 360.0;
+        map.add(o);
+    }
+    let scene = crate::mesh::build_scene(&map, &mut ModelCache::default());
+    let brute = |o: Vec3, d: Vec3| {
+        let mut best: Option<(f32, u64)> = None;
+        for wm in &scene {
+            for t in &wm.mesh.tris {
+                if let Some(tt) = crate::view3d::ray_tri(o, d, wm.pos[t[0] as usize], wm.pos[t[1] as usize], wm.pos[t[2] as usize]) {
+                    if best.is_none_or(|b| tt < b.0) {
+                        best = Some((tt, wm.id));
+                    }
+                }
+            }
+        }
+        best
+    };
+    for i in 0..200 {
+        let o = Vec3::new(rnd() * 240.0 - 120.0, 5.0 + rnd() * 30.0, rnd() * 240.0 - 120.0);
+        let d = Vec3::new(rnd() - 0.5, rnd() - 0.8, rnd() - 0.5).normalize();
+        let fast = crate::view3d::pick_ray(&scene, o, d).map(|h| (h.t, h.id));
+        let slow = brute(o, d);
+        match (fast, slow) {
+            (Some(a), Some(b)) => assert!((a.0 - b.0).abs() < 1e-3 && (a.1 == b.1 || (a.0 - b.0).abs() < 1e-5), "ray {i}: {a:?} vs {b:?}"),
+            (a, b) => assert_eq!(a.is_some(), b.is_some(), "ray {i}: {a:?} vs {b:?}"),
+        }
+    }
+}
+
+/// Each untitled session autosaves to its own file (they used to share one,
+/// so a new map overwrote the last one's work), and unsaved work is found.
+#[test]
+fn autosaves_dont_overwrite_each_other() {
+    use crate::autosave::*;
+    let dir = out_dir("autosave_names");
+    for e in std::fs::read_dir(&dir).unwrap().flatten() {
+        let _ = std::fs::remove_file(e.path());
+    }
+    let a = file_for(&dir, None, "untitled", 1000);
+    let b = file_for(&dir, None, "untitled", 2000);
+    assert_ne!(a, b, "two untitled sessions, two files");
+    let saved = file_for(&dir, Some(std::path::Path::new(r"C:\maps\My House.anvil")), "untitled", 1000);
+    assert_eq!(saved.file_name().unwrap(), "My_House_autosave.anvil");
+    assert_eq!(file_for(&dir, Some(std::path::Path::new(r"C:\maps\My House.anvil")), "x", 5), saved, "a saved map keeps one autosave");
+    // nothing yet
+    assert!(unsaved_work(&dir, &[]).is_none());
+    std::fs::write(&a, "{}").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // a map saved after the autosave: nothing to offer
+    let map_file = dir.join("saved_map.anvil");
+    std::fs::write(&map_file, "{}").unwrap();
+    assert!(unsaved_work(&dir, &[map_file.to_string_lossy().to_string()]).is_none());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // newer unsaved work: offered, the newest one
+    std::fs::write(&b, "{}").unwrap();
+    let (found, _) = unsaved_work(&dir, &[map_file.to_string_lossy().to_string()]).unwrap();
+    assert_eq!(found, b);
+    // old untitled sessions are trimmed to the newest 15
+    for i in 0..20 {
+        std::fs::write(file_for(&dir, None, "untitled", 10 + i), "{}").unwrap();
+    }
+    prune(&dir);
+    let left = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains('-')).count();
+    assert_eq!(left, 15);
+    assert!(map_file.is_file(), "maps themselves are never touched");
+    assert_eq!(ago(std::time::SystemTime::now()), "just now");
+}

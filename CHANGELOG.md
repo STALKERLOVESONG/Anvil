@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.6
+
+- **Placing props:**
+  - Props, lights, spawns and prompts drop the moment you press the mouse. Before, they
+    waited for the release, and a slight wiggle while clicking turned the click into a
+    drag that placed nothing.
+  - **R / Shift+R** turn what you're placing by 15° (Alt+R: 90°), or **Alt+scroll** in
+    the 3D view. The preview shows it.
+  - The preview no longer rebuilds the model on every mouse move.
+  - Picking under the mouse checks the nearest objects first.
+- **Autosave can't lose work any more.** Every untitled map used to autosave to the same
+  file, so starting a new map overwrote the last one's autosave (and anything imported
+  into it) within minutes.
+  - Each untitled session now has its own autosave; the newest 15 are kept.
+  - At start, Anvil offers to reopen unsaved work that's newer than your last saved map.
+- **Object list selection:**
+  - **Shift+click** adds or removes one object at a time.
+  - **Ctrl+click** selects everything between the last object you clicked and this one.
+- **Playtest plugins:** a plugin with `fn playtest()` takes over F5. Shift+F5 is still
+  Anvil's own playtest.
+  - Such a plugin can export the textured map (`export_scene`).
+  - It can also export the collision boxes (`export_boxes`), with door holes kept open
+    and ramps turned into steps.
+- **Plugin permission `programs: true`:** the plugin may ask you to pick folders and start
+  `.exe` programs inside them, asking you Yes / No the first time for each program.
+  - It can't start scripts, programs on network shares, or anything it downloaded
+    itself.
+
 ## 0.2.5
 
 - **3D view much faster again:**

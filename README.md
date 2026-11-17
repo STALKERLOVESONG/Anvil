@@ -432,6 +432,26 @@ Bundled plugins:
 
 Each plugin run is one undo step. Scripts are limited to 5M operations, so a runaway loop can't hang the editor.
 
+**Playtest plugins.** A plugin with `fn playtest()` takes over **F5** (Shift+F5 and the
+*Anvil's own* button still start the built-in playtest). To hand the map to an outside
+game it can write it into its own folder:
+
+- `export_scene(name, meters_per_unit)`: the whole map, textured (glTF, PNG pictures).
+- `export_boxes(name, meters_per_unit, props)`: what a player collides with, as upright
+  boxes. Walls keep their door and window holes, ramps become steps, and the first
+  spawn pad is the node `start anvil`.
+
+**Programs (only with `programs: true` in `info()`).** Such a plugin can:
+
+- `pick_folder(title)`: ask you to pick a folder in a normal folder dialog.
+- `granted_folders()`: list the folders you picked for it.
+- `exists(path)`: check whether a file exists inside those folders.
+- `run_program(exe, args, env, cwd)`: start an `.exe` from inside those folders.
+  - It can't start scripts, files it downloaded into its own folder, or programs on
+    network shares.
+  - It can't change `PATH`-like variables.
+  - The first time it wants a program, Anvil asks you with a Yes / No box.
+
 ## Saving & sharing
 
 - **Save** (Ctrl+S) writes an `.anvil` map. It's JSON, and it points at your texture and model files where they are on your PC.

@@ -119,7 +119,7 @@ impl Tool {
             Tool::Door => "Click a wall to cut a door opening (a boolean hole). Click a floor to cut a hatch.",
             Tool::Window => "Click a wall to cut a window opening (adds a glass pane if enabled in Settings).",
             Tool::Trim => "Click a wall in the 3D view to run a trim strip along it at that height. On a building it wraps all the way around (outside or inside, whichever side you click). Ctrl = no height snapping.",
-            Tool::Prop => "Click to place the selected library model.",
+            Tool::Prop => "Click to place the selected library model (it drops the moment you press). R / Shift+R turns it 15° (Alt+R: 90°), or Alt+scroll.",
             Tool::Decal => "Click a wall or floor to stick a decal on it. Pick its image in the Textures window.",
             Tool::Light => "Click to place a point light.",
             Tool::Spawn => "Click to place a spawn point (playtest starts here).",
@@ -238,6 +238,15 @@ pub struct AnvilApp {
     pub(crate) hovered_slot: Option<usize>,
     pub(crate) title: String,
     pub(crate) layout_pts: Vec<Vec3>,
+    /// Last object clicked in the object list (where a Ctrl+click range starts).
+    pub(crate) outliner_anchor: Option<u64>,
+    /// Turn (degrees about up) for props, spawns and prompts being placed:
+    /// R / Shift+R or Alt+scroll while placing.
+    pub(crate) place_yaw: f32,
+    /// When this Anvil started (names this session's untitled autosave).
+    pub(crate) session_id: u64,
+    /// Unsaved work found at start (newest autosave), offered to reopen.
+    pub(crate) restore_offer: Option<(PathBuf, std::time::SystemTime)>,
     /// Camera as last drawn, and when it last moved (for drawing faster while moving).
     pub(crate) last_cam: Option<crate::view3d::Camera>,
     pub(crate) cam_moved_at: f64,
@@ -465,6 +474,7 @@ fn dist_point_segment(p: Vec3, a: Vec3, b: Vec3) -> (f32, Vec3) {
 impl AnvilApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let settings = Settings::load();
+        let restore_offer = crate::autosave::unsaved_work(&crate::autosave::dir(), &settings.recent_files);
         let key = cloud::load_key();
         let trusted_plugins = settings.trusted_plugins.clone();
         let mut app = AnvilApp {
@@ -524,6 +534,10 @@ impl AnvilApp {
             hovered_slot: None,
             title: String::new(),
             layout_pts: Vec::new(),
+            outliner_anchor: None,
+            place_yaw: 0.0,
+            session_id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            restore_offer,
             last_cam: None,
             cam_moved_at: 0.0,
             edit: None,
@@ -856,6 +870,20 @@ impl AnvilApp {
         }
     }
 
+    /// Tools that drop one object per click (placed the moment you press).
+    pub(crate) fn is_place_tool(&self) -> bool {
+        matches!(self.tool, Tool::Prop | Tool::Light | Tool::Spawn | Tool::Prompt)
+    }
+
+    /// Turns what's being placed by `deg` (R / Shift+R, Alt+scroll).
+    pub(crate) fn turn_placement(&mut self, deg: f32) {
+        self.place_yaw = (self.place_yaw + deg).rem_euclid(360.0);
+        if (self.place_yaw - 360.0).abs() < 1e-3 {
+            self.place_yaw = 0.0;
+        }
+        self.status = format!("Placing turned {:.0}° (R / Shift+R or Alt+scroll to turn)", self.place_yaw);
+    }
+
     /// The object a click with the current tool would add at `at`.
     pub(crate) fn placement(&self, at: Vec3, on_surface: bool) -> Result<Object, String> {
         let s = &self.settings;
@@ -897,7 +925,11 @@ impl AnvilApp {
             }
             _ => None,
         };
-        obj.ok_or_else(String::new)
+        let mut obj = obj.ok_or_else(String::new)?;
+        if matches!(self.tool, Tool::Prop | Tool::Spawn | Tool::Prompt) {
+            obj.rot.y = self.place_yaw;
+        }
+        Ok(obj)
     }
 
     /// Sticks a decal on a surface with normal `n`.
@@ -1149,7 +1181,7 @@ impl AnvilApp {
 
     // ----- file operations -----------------------------------------------
 
-    fn confirm_discard(&self) -> bool {
+    pub(crate) fn confirm_discard(&self) -> bool {
         if !self.dirty {
             return true;
         }
@@ -1161,7 +1193,8 @@ impl AnvilApp {
             == rfd::MessageDialogResult::Yes
     }
 
-    fn reset_after_load(&mut self) {
+    pub(crate) fn reset_after_load(&mut self) {
+        self.restore_offer = None;
         self.undo.clear();
         self.redo.clear();
         self.selection.clear();
@@ -1267,23 +1300,6 @@ impl AnvilApp {
         };
     }
 
-    fn autosave_dir() -> PathBuf {
-        std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| PathBuf::from(".")).join("autosave")
-    }
-
-    fn autosave(&mut self, now: f64) {
-        self.last_autosave = now;
-        let dir = Self::autosave_dir();
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
-        let name: String = self.map.name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-        let p = dir.join(format!("{name}_autosave.anvil"));
-        if self.map.save(&p).is_ok() {
-            self.status = format!("Autosaved to {}", p.display());
-        }
-    }
-
     fn save_to(&mut self, p: PathBuf) {
         match self.map.save(&p) {
             Ok(()) => {
@@ -1385,6 +1401,17 @@ impl AnvilApp {
     }
 
     // ----- playtest -------------------------------------------------------
+
+    /// F5: a plugin's playtest if one offers it (the TRP plugin), else Anvil's own.
+    fn playtest_pressed(&mut self, ctx: &egui::Context) {
+        match self.plugins.playtest_plugin() {
+            Some(i) => {
+                let out = self.plugins.playtest(i, &self.map, &self.models, self.settings.grid);
+                self.apply_outcome(out);
+            }
+            None => self.start_playtest(ctx),
+        }
+    }
 
     fn start_playtest(&mut self, ctx: &egui::Context) {
         if self.play.is_some() {
@@ -1497,7 +1524,11 @@ impl AnvilApp {
         let (cmd, shift, sec) = ctx.input(|i| (i.modifiers.command, i.modifiers.shift, i.pointer.secondary_down()));
         let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
         if pressed(Key::F5) {
-            self.start_playtest(ctx);
+            if shift {
+                self.start_playtest(ctx);
+            } else {
+                self.playtest_pressed(ctx);
+            }
             return;
         }
         if cmd {
@@ -1644,6 +1675,10 @@ impl AnvilApp {
         if self.tool == Tool::Select {
             self.gizmo_keys(ctx);
         }
+        if self.is_place_tool() && !cmd && pressed(Key::R) {
+            let step = if ctx.input(|i| i.modifiers.alt) { 90.0 } else { 15.0 };
+            self.turn_placement(if shift { -step } else { step });
+        }
         for t in Tool::BASIC {
             if let Some((k, _)) = t.key() {
                 if pressed(k) {
@@ -1744,7 +1779,7 @@ impl AnvilApp {
                     });
                     if ui.button("Open autosave folder").clicked() {
                         ui.close_menu();
-                        let d = Self::autosave_dir();
+                        let d = crate::autosave::dir();
                         let _ = std::fs::create_dir_all(&d);
                         let _ = std::process::Command::new("explorer").arg(d).spawn();
                     }
@@ -1938,7 +1973,15 @@ impl AnvilApp {
                     self.show_help = !self.show_help;
                 }
                 ui.separator();
-                if ui.add(egui::Button::new(RichText::new("▶ Playtest").strong()).shortcut_text("F5")).clicked() {
+                let plugin_play = self.plugins.playtest_plugin().map(|i| self.plugins.plugins[i].name.clone());
+                let tip = match &plugin_play {
+                    Some(n) => format!("Playtest with the {n} plugin (Shift+F5: Anvil's own)"),
+                    None => "Walk around the map".to_string(),
+                };
+                if ui.add(egui::Button::new(RichText::new("▶ Playtest").strong()).shortcut_text("F5")).on_hover_text(tip).clicked() {
+                    self.playtest_pressed(ctx);
+                }
+                if plugin_play.is_some() && ui.small_button("Anvil's own").on_hover_text("Anvil's built-in playtest (Shift+F5)").clicked() {
                     self.start_playtest(ctx);
                 }
                 ui.separator();
@@ -2479,8 +2522,28 @@ impl AnvilApp {
             self.rename_folder = Some((fid, name));
         }
         if let Some(id) = act.click {
-            self.click_select(Some(id), add);
+            let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+            let order = self.outliner_order();
+            self.selection = outliner_pick(&self.selection, &order, self.outliner_anchor, id, shift, ctrl);
+            self.outliner_anchor = Some(id);
         }
+    }
+
+    /// Every object in the order the object list shows them (folders first,
+    /// as nested, then loose objects), whether or not a folder is collapsed.
+    fn outliner_order(&self) -> Vec<u64> {
+        fn walk(map: &Map, parent: Option<u64>, depth: usize, out: &mut Vec<u64>) {
+            if depth > 32 {
+                return;
+            }
+            for f in map.folders.iter().filter(|f| f.parent == parent) {
+                walk(map, Some(f.id), depth + 1, out);
+            }
+            out.extend(map.objects.iter().filter(|o| map.folder_of(o) == parent).map(|o| o.id));
+        }
+        let mut out = Vec::new();
+        walk(&self.map, None, 0, &mut out);
+        out
     }
 
     fn outliner_level(&self, ui: &mut egui::Ui, parent: Option<u64>, depth: usize, act: &mut OutAct) {
@@ -2557,12 +2620,15 @@ impl AnvilApp {
                     ("Drag handles", "Resize selection"),
                     ("Shift + drag", "Clone and move"),
                     ("Shift / Ctrl + click", "Add to / remove from selection"),
+                    ("Object list: Shift + click", "Add or remove one object at a time"),
+                    ("Object list: Ctrl + click", "Select everything between the last clicked object and this one"),
                     ("W / E / R / X", "Transform Gizmo: move / rotate / scale handles, local-global axes (Ctrl = no snap)"),
                     ("Ctrl+G / Ctrl+Shift+G", "Group selection into a folder / ungroup"),
                     ("Building tool", "Click corners, click the first point / double-click / Enter to close"),
                     ("Ctrl+Shift+C", "Boolean: carve every Box brush the selected boxes overlap"),
                     ("Tab", "Mesh edit mode (1 vertices, 2 faces, Ctrl+E extrude, M merge, N flip, Del delete)"),
-                    ("F5", "Playtest (WASD, mouse, Space, Shift, Esc)"),
+                    ("F5", "Playtest (WASD, mouse, Space, Shift, Esc); with a playtest plugin, that plugin's"),
+                    ("Shift+F5", "Anvil's own playtest, even with a playtest plugin"),
                     ("3D: hold right mouse", "Look around, WASD to fly, Q/E down/up, Shift faster"),
                     ("3D: middle drag / scroll", "Pan / dolly"),
                     ("[  ]", "Halve / double grid size"),
@@ -2719,6 +2785,15 @@ impl AnvilApp {
             return;
         }
 
+        // props, lights, spawns and prompts drop the moment you press
+        if self.is_place_tool() && self.edit.is_none() && resp.hovered() && ctx.input(|i| i.pointer.primary_pressed()) && !mods.alt {
+            if let Some(p) = resp.hover_pos().filter(|p| !header.contains(*p)) {
+                let top = view.kind == ViewKind::Top;
+                let at = view.uv_to_world(snap2(view.screen_to_uv(rect, p), g), if top { self.work_y } else { 0.0 });
+                self.place(at, top);
+            }
+        }
+
         if resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
                 if !header.contains(p) || self.tool != Tool::Select {
@@ -2785,6 +2860,7 @@ impl AnvilApp {
                             };
                             self.place_text(at, yaw, None);
                         }
+                        _ if self.is_place_tool() => {} // already placed on the press
                         _ => {
                             let top = view.kind == ViewKind::Top;
                             let at = view.uv_to_world(uv, if top { self.work_y } else { 0.0 });
@@ -3341,16 +3417,35 @@ impl AnvilApp {
         let g = self.snap_step();
         let mods = ctx.input(|i| i.modifiers);
         let add = mods.command || mods.shift;
-        self.camera_nav(rect, resp, ctx);
-        if let Some(hp) = resp.hover_pos() {
-            let (o, d) = self.cam.ray(rect, fov, hp);
-            let p = pick_ray(scene, o, d).map(|h| h.point).or_else(|| ray_plane(o, d, self.work_y));
-            if let Some(p) = p {
-                self.cursor_text = format!("X {}  Y {}  Z {}", fmt_num(p.x), fmt_num(p.y), fmt_num(p.z));
+        // Alt+scroll turns what's being placed (instead of moving the camera)
+        if self.is_place_tool() && mods.alt && resp.hovered() {
+            let wheel = ctx.input(|i| i.raw_scroll_delta.y);
+            if wheel != 0.0 {
+                self.turn_placement(if wheel > 0.0 { 15.0 } else { -15.0 });
+                ctx.input_mut(|i| {
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    i.raw_scroll_delta = egui::Vec2::ZERO;
+                });
             }
         }
+        self.camera_nav(rect, resp, ctx);
+        // one pick under the mouse per frame, for the readout and the placing ghost
+        let under = resp.hover_pos().and_then(|hp| {
+            let (o, d) = self.cam.ray(rect, fov, hp);
+            pick_ray(scene, o, d).map(|h| h.point).or_else(|| ray_plane(o, d, self.work_y))
+        });
+        if let Some(p) = under {
+            self.cursor_text = format!("X {}  Y {}  Z {}", fmt_num(p.x), fmt_num(p.y), fmt_num(p.z));
+        }
 
-        self.hover_3d(rect, scene, resp.hover_pos(), mods.command);
+        self.hover_3d(rect, under, resp.hover_pos(), mods.command);
+        // props, lights, spawns and prompts drop the moment you press: no
+        // waiting for the release, and a slight wiggle doesn't eat the click
+        if self.is_place_tool() && self.edit.is_none() && self.poly_extrude.is_none() && resp.hovered() && ctx.input(|i| i.pointer.primary_pressed()) && !mods.alt {
+            if let Some(pt) = under {
+                self.place(Vec3::new(snap(pt.x, g), pt.y, snap(pt.z, g)), true);
+            }
+        }
         if self.poly_extrude.is_some() {
             if resp.clicked() {
                 self.extrude_click();
@@ -3477,6 +3572,7 @@ impl AnvilApp {
                             self.status = "Click on a part".into();
                         }
                     }
+                    _ if self.is_place_tool() => {} // already placed on the press
                     _ => {
                         let pt = pick_ray(scene, o, d).map(|h| h.point).or_else(|| ray_plane(o, d, self.work_y));
                         if let Some(pt) = pt {
@@ -3833,6 +3929,41 @@ impl AnvilApp {
     }
 }
 
+/// The selection after clicking `id` in the object list:
+/// plain click = just it; Shift = add or remove it (one by one);
+/// Ctrl = add everything between the last clicked object and it.
+pub(crate) fn outliner_pick(sel: &[u64], order: &[u64], anchor: Option<u64>, id: u64, shift: bool, ctrl: bool) -> Vec<u64> {
+    let mut out = sel.to_vec();
+    if ctrl {
+        let a = anchor.and_then(|a| order.iter().position(|x| *x == a));
+        let b = order.iter().position(|x| *x == id);
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                for x in &order[a.min(b)..=a.max(b)] {
+                    if !out.contains(x) {
+                        out.push(*x);
+                    }
+                }
+            }
+            _ => {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+    } else if shift {
+        match out.iter().position(|x| *x == id) {
+            Some(i) => {
+                out.remove(i);
+            }
+            None => out.push(id),
+        }
+    } else {
+        out = vec![id];
+    }
+    out
+}
+
 #[derive(Default)]
 struct OutAct {
     click: Option<u64>,
@@ -3873,7 +4004,7 @@ impl eframe::App for AnvilApp {
             self.last_autosave = now;
         }
         if self.dirty && self.settings.autosave_minutes > 0.0 && now - self.last_autosave > self.settings.autosave_minutes as f64 * 60.0 {
-            self.autosave(now);
+            self.autosave_now(now);
         }
         if self.dirty && self.settings.autosave_minutes > 0.0 {
             ctx.request_repaint_after(std::time::Duration::from_secs(30));
@@ -3883,6 +4014,7 @@ impl eframe::App for AnvilApp {
         if self.play.is_none() {
             self.menu_bar(ctx);
             self.update_banner(ctx);
+            self.restore_banner(ctx);
             self.status_bar(ctx);
             self.library_panel(ctx);
             self.right_panel(ctx);

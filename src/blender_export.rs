@@ -50,6 +50,8 @@ struct Doc {
     textures: Vec<Value>,
     image_keys: HashMap<String, Option<usize>>,
     lights: Vec<Value>,
+    /// Write every picture as PNG (for readers without JPEG).
+    png_only: bool,
 }
 
 impl Doc {
@@ -66,7 +68,7 @@ impl Doc {
             // glTF only takes PNG / JPEG: convert anything else
             let (bytes, mime) = match ext.as_str() {
                 "png" => (bytes, "image/png"),
-                "jpg" | "jpeg" => (bytes, "image/jpeg"),
+                "jpg" | "jpeg" if !self.png_only => (bytes, "image/jpeg"),
                 _ => {
                     let img = crate::texture::open_image(path)?;
                     let mut out = std::io::Cursor::new(Vec::new());
@@ -195,7 +197,12 @@ fn folder_path(map: &Map, mut cur: Option<u64>) -> String {
 
 /// The whole map as a binary glTF. `k` = meters per stud (unit scale).
 pub fn scene_glb(map: &Map, models: &mut ModelCache, k: f32) -> Vec<u8> {
-    let mut d = Doc::default();
+    scene_glb_with(map, models, k, false)
+}
+
+/// `scene_glb`, optionally with every picture as PNG.
+pub fn scene_glb_with(map: &Map, models: &mut ModelCache, k: f32, png_only: bool) -> Vec<u8> {
+    let mut d = Doc { png_only, ..Default::default() };
     let mut nodes: Vec<Value> = Vec::new();
     let mut children_of: HashMap<Option<u64>, Vec<usize>> = HashMap::new();
     for o in map.objects.iter().filter(|o| !o.hidden) {

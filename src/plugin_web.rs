@@ -375,3 +375,211 @@ fn widget(d: &Dynamic) -> Option<Widget> {
         _ => return None,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Folders the user picked for a plugin, and programs they allowed it to start
+// (only plugins whose info() says `programs: true`).
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Grants {
+    /// plugin file -> folders the user picked for it (canonical paths)
+    folders: HashMap<String, Vec<String>>,
+    /// plugin file -> programs the user allowed it to start (canonical paths)
+    programs: HashMap<String, Vec<String>>,
+}
+
+fn grants_path() -> PathBuf {
+    #[cfg(test)]
+    {
+        return std::env::temp_dir().join("anvil_tests").join("plugin_grants.json");
+    }
+    #[allow(unreachable_code)]
+    std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| PathBuf::from(".")).join("plugin_grants.json")
+}
+
+fn load_grants() -> Grants {
+    std::fs::read_to_string(grants_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+fn save_grants(g: &Grants) {
+    let p = grants_path();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(g) {
+        let _ = std::fs::write(p, s);
+    }
+}
+
+/// A path in full, without the `\\?\` prefix canonicalize adds on Windows
+/// (a plugin builds paths on it, and that prefix looks like a network
+/// share). A real share (`\\?\UNC\...`) keeps it.
+fn plain(p: &Path) -> Option<PathBuf> {
+    let c = p.canonicalize().ok()?;
+    let s = c.to_string_lossy().to_string();
+    Some(match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+        _ => c,
+    })
+}
+
+/// Records a folder the user picked for `plugin` (also used by tests).
+pub fn grant_folder(plugin: &str, dir: &Path) -> Option<String> {
+    if crate::texture::is_network_path(&dir.to_string_lossy()) && !dir.is_dir() {
+        return None;
+    }
+    let canon = plain(dir)?;
+    let s = canon.to_string_lossy().to_string();
+    let mut g = load_grants();
+    let list = g.folders.entry(plugin.to_string()).or_default();
+    if !list.contains(&s) {
+        list.push(s.clone());
+    }
+    save_grants(&g);
+    Some(s)
+}
+
+/// Asks the user to pick a folder for the plugin (a normal folder dialog).
+/// The plugin may then look for files and start programs inside it.
+pub fn pick_folder(plugin: &str, title: &str) -> String {
+    let title: String = title.chars().take(120).collect();
+    match rfd::FileDialog::new().set_title(format!("{title}  (for the plugin {plugin})")).pick_folder() {
+        Some(d) => grant_folder(plugin, &d).unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+pub fn granted_folders(plugin: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in load_grants().folders.get(plugin).cloned().unwrap_or_default() {
+        // older entries were kept with the `\\?\` prefix
+        let s = match s.strip_prefix(r"\\?\") {
+            Some(rest) if !rest.starts_with("UNC") => rest.to_string(),
+            _ => s,
+        };
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Is `path` inside a folder the user picked for `plugin` (or its own folder)?
+pub fn in_granted(plugin: &str, path: &Path) -> bool {
+    let Some(p) = plain(path) else { return false };
+    if inside(path, &plugin_dir(plugin)) {
+        return true;
+    }
+    granted_folders(plugin).iter().any(|g| p.starts_with(g))
+}
+
+/// Whether a file or folder exists, for paths the plugin may look at.
+pub fn exists(plugin: &str, path: &str) -> bool {
+    let p = Path::new(path);
+    in_granted(plugin, p) && p.exists()
+}
+
+/// Environment variables a plugin may set for a program it starts: plain
+/// names, none that change how Windows finds or runs things.
+fn env_ok(k: &str, v: &str) -> bool {
+    const DENY: [&str; 12] = ["PATH", "PATHEXT", "COMSPEC", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "PROGRAMFILES"];
+    let name_ok = !k.is_empty() && k.len() <= 64 && k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    name_ok && !DENY.contains(&k.to_ascii_uppercase().as_str()) && v.len() <= 4096 && !v.contains('\0')
+}
+
+/// Asks the user (a Yes / No box) whether the plugin may start `exe`.
+fn ask_to_run(plugin_name: &str, exe: &str, args: &[String]) -> bool {
+    #[cfg(test)]
+    {
+        let _ = (plugin_name, exe, args);
+        return false;
+    }
+    #[allow(unreachable_code)]
+    {
+        let shown: String = args.join(" ").chars().take(400).collect();
+        rfd::MessageDialog::new()
+            .set_title("Allow a plugin to start a program?")
+            .set_description(format!("The plugin \"{plugin_name}\" wants to start this program:\n\n{exe}\n\nwith: {shown}\n\nAllow it? (It's remembered for this program.)"))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .set_level(rfd::MessageLevel::Warning)
+            .show()
+            == rfd::MessageDialogResult::Yes
+    }
+}
+
+/// Records that `plugin` may start `exe` (also used by tests).
+pub fn allow_program(plugin: &str, exe: &Path) {
+    if let Some(c) = plain(exe) {
+        let mut g = load_grants();
+        let list = g.programs.entry(plugin.to_string()).or_default();
+        let s = c.to_string_lossy().to_string();
+        if !list.contains(&s) {
+            list.push(s);
+        }
+        save_grants(&g);
+    }
+}
+
+/// Checks a program start: an .exe inside a folder the user picked for the
+/// plugin (not one the plugin downloaded into its own folder), sane
+/// arguments and environment, a working folder the user picked too.
+/// Returns the program, its working folder and its environment.
+pub fn check_run(plugin: &str, exe: &str, args: &[String], env: &[(String, String)], cwd: &str) -> Result<(PathBuf, PathBuf), String> {
+    if crate::texture::is_network_path(exe) {
+        return Err("programs on network shares can't be started".into());
+    }
+    let p = Path::new(exe);
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if ext != "exe" || !p.is_file() {
+        return Err(format!("{exe} isn't a program (.exe)"));
+    }
+    let canon = plain(p).ok_or("can't find that program")?;
+    if inside(p, &plugin_dir(plugin)) || !granted_folders(plugin).iter().any(|g| canon.starts_with(g)) {
+        return Err(format!("{exe} isn't in a folder you picked for this plugin"));
+    }
+    if args.len() > 64 || args.iter().any(|a| a.len() > 2048 || a.contains('\0')) {
+        return Err("too many or too long arguments".into());
+    }
+    if let Some((k, _)) = env.iter().find(|(k, v)| !env_ok(k, v)) {
+        return Err(format!("the plugin can't set {k}"));
+    }
+    let wd = if cwd.is_empty() { canon.parent().map(|d| d.to_path_buf()).unwrap_or_default() } else { PathBuf::from(cwd) };
+    if !wd.is_dir() || !granted_folders(plugin).iter().any(|g| plain(&wd).is_some_and(|w| w.starts_with(g))) {
+        return Err("the working folder isn't one you picked for this plugin".into());
+    }
+    Ok((canon, wd))
+}
+
+/// Starts a program for a plugin (after asking the user the first time).
+pub fn run_program(plugin: &str, plugin_name: &str, exe: &str, args: &[String], env: &[(String, String)], cwd: &str) -> Result<(), String> {
+    let (canon, wd) = check_run(plugin, exe, args, env, cwd)?;
+    let s = canon.to_string_lossy().to_string();
+    let allowed = load_grants().programs.get(plugin).is_some_and(|l| l.contains(&s));
+    if !allowed {
+        if !ask_to_run(plugin_name, &s, args) {
+            return Err("you said no".into());
+        }
+        allow_program(plugin, &canon);
+    }
+    let mut cmd = std::process::Command::new(&canon);
+    cmd.args(args).current_dir(&wd);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0000_0010); // CREATE_NEW_CONSOLE: its own window, so its messages show
+    }
+    cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Tests: forget every folder and program granted to a plugin.
+#[cfg(test)]
+pub fn forget_grants(plugin: &str) {
+    let mut g = load_grants();
+    g.folders.remove(plugin);
+    g.programs.remove(plugin);
+    save_grants(&g);
+}

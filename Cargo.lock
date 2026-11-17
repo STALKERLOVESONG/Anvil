@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "anvil"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "earcutr",
  "eframe",
