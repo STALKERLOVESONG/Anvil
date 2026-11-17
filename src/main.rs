@@ -2,6 +2,7 @@
 
 mod app;
 mod autosave;
+mod clipboard;
 mod branding;
 mod blender_export;
 mod building;
@@ -9,6 +10,7 @@ mod content_ui;
 mod cloud;
 mod collide;
 mod csg;
+mod edge_loops;
 mod editmode;
 mod entities;
 mod export_roblox;

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.7
+
+- **Copy and paste:**
+  - **Ctrl+C / Ctrl+X / Ctrl+V** copy, cut and paste objects, with their textures.
+  - Pasting puts them where your mouse is (on the surface under it in 3D), or one
+    grid step over when the mouse isn't over a view.
+  - It goes through the system clipboard, so it works between two Anvil windows too.
+- **Ctrl+D duplicates in place.** The copies stay exactly where the originals are,
+  selected, ready to move (it used to shift them a grid step).
+- **Mesh edit mode (Tab):**
+  - **Edge mode:** 1 Vertices, 2 Edges, 3 Faces. What's selected carries over when you
+    switch.
+  - **Alt+click selects a loop:** an edge loop in edge mode (its vertices in vertex
+    mode), or a ring of faces in face mode.
+    - The loop goes straight on through four-edge vertices and follows a hole's border.
+    - Shift+Alt+click adds to the selection.
+  - Deleting edges deletes the faces they border.
+
 ## 0.2.6
 
 - **Placing props:**

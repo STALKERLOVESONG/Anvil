@@ -243,6 +243,10 @@ pub struct AnvilApp {
     /// Turn (degrees about up) for props, spawns and prompts being placed:
     /// R / Shift+R or Alt+scroll while placing.
     pub(crate) place_yaw: f32,
+    /// The point under the mouse in the view it's over (where Ctrl+V pastes).
+    pub(crate) cursor_world: Option<Vec3>,
+    /// The last copy, for Edit > Paste (Ctrl+V reads the system clipboard).
+    pub(crate) clip_text: Option<String>,
     /// When this Anvil started (names this session's untitled autosave).
     pub(crate) session_id: u64,
     /// Unsaved work found at start (newest autosave), offered to reopen.
@@ -536,6 +540,8 @@ impl AnvilApp {
             layout_pts: Vec::new(),
             outliner_anchor: None,
             place_yaw: 0.0,
+            cursor_world: None,
+            clip_text: None,
             session_id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
             restore_offer,
             last_cam: None,
@@ -692,6 +698,64 @@ impl AnvilApp {
 
     pub(crate) fn selected_objects(&self) -> Vec<Object> {
         self.selection.iter().filter_map(|id| self.map.get(*id).cloned()).collect()
+    }
+
+    /// Ctrl+D: copies of the selection exactly where it is (selected, ready to move).
+    pub(crate) fn duplicate_in_place(&mut self) {
+        self.push_undo();
+        self.duplicate(Vec3::ZERO);
+        self.status = format!("Duplicated {} object(s) in place: drag them or use the arrow keys to move them", self.selection.len());
+    }
+
+    /// Ctrl+C (Ctrl+X with `cut`): the selection onto the clipboard.
+    pub(crate) fn copy_selection(&mut self, ctx: &egui::Context, cut: bool) {
+        let Some(text) = crate::clipboard::copy(&self.map, &self.selection) else {
+            self.status = "Select something to copy".into();
+            return;
+        };
+        ctx.copy_text(text.clone());
+        self.clip_text = Some(text);
+        let n = self.selection.len();
+        if cut {
+            self.delete_selection();
+            self.status = format!("Cut {n} object(s): Ctrl+V pastes them where your mouse is");
+        } else {
+            self.status = format!("Copied {n} object(s): Ctrl+V pastes them where your mouse is");
+        }
+    }
+
+    /// Pastes clipboard objects: under the mouse when it's over a view
+    /// (`at_mouse`), else one grid step over from where they were copied.
+    pub(crate) fn paste_text(&mut self, text: &str, at_mouse: bool) {
+        let Some(clip) = crate::clipboard::parse(text) else { return };
+        let g = self.snap_step();
+        let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for o in &clip.objects {
+            let wm = world_mesh(o, &clip.textures, &mut self.models);
+            if !wm.pos.is_empty() {
+                mn = mn.min(wm.min);
+                mx = mx.max(wm.max);
+            }
+        }
+        if mn.x > mx.x {
+            let c = clip.objects.iter().fold(Vec3::ZERO, |a, o| a + o.pos) / clip.objects.len() as f32;
+            (mn, mx) = (c, c);
+        }
+        let target = if at_mouse && self.hovered_slot.is_some() { self.cursor_world } else { None };
+        let delta = match target {
+            // the group's bottom middle lands on the point under the mouse
+            Some(p) => {
+                let d = p - Vec3::new((mn.x + mx.x) * 0.5, mn.y, (mn.z + mx.z) * 0.5);
+                Vec3::new(snap(d.x, g), d.y, snap(d.z, g))
+            }
+            None => {
+                let s = self.settings.grid.max(1.0);
+                Vec3::new(s, 0.0, s)
+            }
+        };
+        self.push_undo();
+        self.selection = crate::clipboard::paste(&mut self.map, &clip, delta);
+        self.status = format!("Pasted {} object(s)", self.selection.len());
     }
 
     /// Duplicates the selection (offset by `offset`) and selects the copies.
@@ -1523,6 +1587,24 @@ impl AnvilApp {
         }
         let (cmd, shift, sec) = ctx.input(|i| (i.modifiers.command, i.modifiers.shift, i.pointer.secondary_down()));
         let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
+        // Ctrl+C / Ctrl+X / Ctrl+V arrive as copy / cut / paste events
+        if self.edit.is_none() {
+            let events = ctx.input(|i| i.events.clone());
+            for ev in events {
+                match ev {
+                    egui::Event::Copy if shift => self.carve_selection(),
+                    egui::Event::Copy => self.copy_selection(ctx, false),
+                    egui::Event::Cut => self.copy_selection(ctx, true),
+                    egui::Event::Paste(text) => {
+                        let text = if crate::clipboard::parse(&text).is_some() { Some(text) } else { self.clip_text.clone() };
+                        if let Some(t) = text {
+                            self.paste_text(&t, true);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         if pressed(Key::F5) {
             if shift {
                 self.start_playtest(ctx);
@@ -1578,9 +1660,7 @@ impl AnvilApp {
                 return;
             }
             if pressed(Key::D) && !self.selection.is_empty() {
-                self.push_undo();
-                let g = self.settings.grid.max(1.0);
-                self.duplicate(Vec3::new(g, 0.0, g));
+                self.duplicate_in_place();
             }
             if pressed(Key::A) {
                 self.selection = self.map.objects.iter().filter(|o| !o.hidden).map(|o| o.id).collect();
@@ -1606,10 +1686,13 @@ impl AnvilApp {
                 self.status = "Left mesh edit mode".into();
             }
             if pressed(Key::Num1) {
-                self.set_edit_mode(false);
+                self.set_edit_mode(0);
             }
             if pressed(Key::Num2) {
-                self.set_edit_mode(true);
+                self.set_edit_mode(1);
+            }
+            if pressed(Key::Num3) {
+                self.set_edit_mode(2);
             }
             self.gizmo_keys(ctx);
             if pressed(Key::Delete) {
@@ -1816,12 +1899,24 @@ impl AnvilApp {
                         self.redo();
                     }
                     ui.separator();
-                    if ui.add(egui::Button::new("Duplicate").shortcut_text("Ctrl+D")).clicked() {
+                    if ui.add(egui::Button::new("Copy").shortcut_text("Ctrl+C")).clicked() {
+                        ui.close_menu();
+                        self.copy_selection(ui.ctx(), false);
+                    }
+                    if ui.add(egui::Button::new("Cut").shortcut_text("Ctrl+X")).clicked() {
+                        ui.close_menu();
+                        self.copy_selection(ui.ctx(), true);
+                    }
+                    if ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+                        ui.close_menu();
+                        if let Some(t) = self.clip_text.clone() {
+                            self.paste_text(&t, false);
+                        }
+                    }
+                    if ui.add(egui::Button::new("Duplicate in place").shortcut_text("Ctrl+D")).clicked() {
                         ui.close_menu();
                         if !self.selection.is_empty() {
-                            self.push_undo();
-                            let g = self.settings.grid.max(1.0);
-                            self.duplicate(Vec3::new(g, 0.0, g));
+                            self.duplicate_in_place();
                         }
                     }
                     if ui.add(egui::Button::new("Delete").shortcut_text("Del")).clicked() {
@@ -2626,14 +2721,15 @@ impl AnvilApp {
                     ("Ctrl+G / Ctrl+Shift+G", "Group selection into a folder / ungroup"),
                     ("Building tool", "Click corners, click the first point / double-click / Enter to close"),
                     ("Ctrl+Shift+C", "Boolean: carve every Box brush the selected boxes overlap"),
-                    ("Tab", "Mesh edit mode (1 vertices, 2 faces, Ctrl+E extrude, M merge, N flip, Del delete)"),
+                    ("Tab", "Mesh edit mode (1 vertices, 2 edges, 3 faces, Alt+click a loop, Ctrl+E extrude, M merge, N flip, Del delete)"),
                     ("F5", "Playtest (WASD, mouse, Space, Shift, Esc); with a playtest plugin, that plugin's"),
                     ("Shift+F5", "Anvil's own playtest, even with a playtest plugin"),
                     ("3D: hold right mouse", "Look around, WASD to fly, Q/E down/up, Shift faster"),
                     ("3D: middle drag / scroll", "Pan / dolly"),
                     ("[  ]", "Halve / double grid size"),
                     ("Arrow keys", "Nudge selection by one grid step in the hovered view"),
-                    ("Ctrl+D", "Duplicate"),
+                    ("Ctrl+D", "Duplicate in place (the copies stay where the originals are, selected)"),
+                    ("Ctrl+C / Ctrl+X / Ctrl+V", "Copy / cut / paste objects (pastes where the mouse is; works between Anvil windows)"),
                     ("Ctrl+H", "Make box hollow"),
                     ("Del", "Delete"),
                     ("H / U", "Hide selected / unhide all"),
@@ -2697,6 +2793,9 @@ impl AnvilApp {
 
         if let Some(hp) = resp.hover_pos() {
             self.hovered_slot = Some(vi + 1);
+            let cv = self.views[vi];
+            let top = cv.kind == ViewKind::Top;
+            self.cursor_world = Some(cv.uv_to_world(cv.screen_to_uv(rect, hp), if top { self.work_y } else { 0.0 }));
             let scroll = ctx.input(|i| i.raw_scroll_delta.y);
             if scroll != 0.0 {
                 let v = &mut self.views[vi];
@@ -3436,6 +3535,9 @@ impl AnvilApp {
         });
         if let Some(p) = under {
             self.cursor_text = format!("X {}  Y {}  Z {}", fmt_num(p.x), fmt_num(p.y), fmt_num(p.z));
+        }
+        if resp.hovered() {
+            self.cursor_world = under;
         }
 
         self.hover_3d(rect, under, resp.hover_pos(), mods.command);

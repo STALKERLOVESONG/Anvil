@@ -1,5 +1,6 @@
-//! Mesh edit mode: select and move vertices or faces of an editable mesh,
-//! extrude / delete / flip faces and merge vertices.
+//! Mesh edit mode: select and move vertices, edges or faces of an editable
+//! mesh (Alt+click selects a whole loop), extrude / delete / flip faces and
+//! merge vertices.
 
 use std::sync::Arc;
 use crate::app::{fmt_num, paint_cmds, snap, snap2, vec3_edit, AnvilApp, Drag};
@@ -17,8 +18,11 @@ use glam::{Mat3, Vec3};
 pub(crate) struct EditState {
     pub obj: u64,
     pub face_mode: bool,
+    /// Edge mode (2): `edges` is the selection.
+    pub edge_mode: bool,
     pub verts: Vec<u32>,
     pub faces: Vec<usize>,
+    pub edges: Vec<[u32; 2]>,
 }
 
 type Proj<'a> = &'a dyn Fn(Vec3) -> Option<Pos2>;
@@ -31,6 +35,19 @@ fn pick_vert(world: &[Vec3], proj: Proj, p: Pos2) -> Option<u32> {
             if d < 8.0 && best.is_none_or(|b| d < b.0) {
                 best = Some((d, i as u32));
             }
+        }
+    }
+    best.map(|b| b.1)
+}
+
+/// The edge drawn nearest to `p` (within a few pixels).
+fn pick_edge(world: &[Vec3], faces: &[Vec<u32>], proj: Proj, p: Pos2) -> Option<[u32; 2]> {
+    let mut best: Option<(f32, [u32; 2])> = None;
+    for e in crate::edge_loops::unique_edges(faces) {
+        let (Some(a), Some(b)) = (world.get(e[0] as usize).and_then(|w| proj(*w)), world.get(e[1] as usize).and_then(|w| proj(*w))) else { continue };
+        let d = crate::view2d::dist_to_segment(p, a, b);
+        if d < 7.0 && best.is_none_or(|x| d < x.0) {
+            best = Some((d, e));
         }
     }
     best.map(|b| b.1)
@@ -102,14 +119,90 @@ impl AnvilApp {
             return;
         }
         self.selection = vec![id];
-        self.edit = Some(EditState { obj: id, face_mode: false, verts: Vec::new(), faces: Vec::new() });
+        self.edit = Some(EditState { obj: id, face_mode: false, edge_mode: false, verts: Vec::new(), faces: Vec::new(), edges: Vec::new() });
         self.drag = Drag::None;
-        self.status = "Mesh edit: 1 vertices, 2 faces, E extrude, M merge, N flip, Del delete, Tab done".into();
+        self.status = "Mesh edit: 1 vertices, 2 edges, 3 faces, Alt+click a loop, E extrude, M merge, N flip, Del delete, Tab done".into();
     }
 
-    pub(crate) fn set_edit_mode(&mut self, face: bool) {
-        if let Some(e) = &mut self.edit {
-            e.face_mode = face;
+    /// 0 vertices, 1 edges, 2 faces. What's selected carries over (like Blender).
+    pub(crate) fn set_edit_mode(&mut self, mode: u8) {
+        let Some((_, _, _, faces)) = self.edit_geometry() else { return };
+        let Some(e) = &mut self.edit else { return };
+        let cur = if e.face_mode { 2 } else if e.edge_mode { 1 } else { 0 };
+        if cur == mode {
+            return;
+        }
+        let face_edges = |f: &Vec<u32>| -> Vec<[u32; 2]> { (0..f.len()).map(|i| crate::edge_loops::key(f[i], f[(i + 1) % f.len()])).collect() };
+        // what's selected, as vertices / edges
+        let verts: Vec<u32> = match cur {
+            1 => crate::edge_loops::edge_verts(&e.edges),
+            2 => {
+                let mut v: Vec<u32> = e.faces.iter().filter_map(|f| faces.get(*f)).flatten().copied().collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            }
+            _ => e.verts.clone(),
+        };
+        let edges: Vec<[u32; 2]> = match cur {
+            1 => e.edges.clone(),
+            2 => {
+                let mut v: Vec<[u32; 2]> = e.faces.iter().filter_map(|f| faces.get(*f)).flat_map(face_edges).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            }
+            _ => crate::edge_loops::unique_edges(&faces).into_iter().filter(|x| verts.contains(&x[0]) && verts.contains(&x[1])).collect(),
+        };
+        match mode {
+            0 => e.verts = verts,
+            1 => e.edges = edges,
+            _ => {
+                e.faces = (0..faces.len())
+                    .filter(|fi| match cur {
+                        1 => face_edges(&faces[*fi]).iter().all(|x| edges.contains(x)),
+                        _ => faces[*fi].iter().all(|v| verts.contains(v)),
+                    })
+                    .collect()
+            }
+        }
+        e.face_mode = mode == 2;
+        e.edge_mode = mode == 1;
+    }
+
+    /// Alt+click: the loop through the edge under the mouse, as the current
+    /// mode's selection (an edge loop, its vertices, or a ring of faces).
+    fn edit_loop_pick(&mut self, edge: Option<[u32; 2]>, add: bool) {
+        let Some((_, _, _, faces)) = self.edit_geometry() else { return };
+        let Some(edge) = edge else {
+            self.status = "Alt+click on an edge to select its loop".into();
+            return;
+        };
+        let Some(e) = self.edit.as_mut() else { return };
+        fn merge_in<T: PartialEq>(list: &mut Vec<T>, new: Vec<T>, add: bool) {
+            if !add {
+                list.clear();
+            }
+            for x in new {
+                if !list.contains(&x) {
+                    list.push(x);
+                }
+            }
+        }
+        if e.face_mode {
+            let ring = crate::edge_loops::face_ring(&faces, edge);
+            let n = ring.len();
+            merge_in(&mut e.faces, ring, add);
+            self.status = format!("Selected a ring of {n} face(s)");
+        } else {
+            let lp = crate::edge_loops::edge_loop(&faces, edge);
+            let n = lp.len();
+            if e.edge_mode {
+                merge_in(&mut e.edges, lp, add);
+            } else {
+                merge_in(&mut e.verts, crate::edge_loops::edge_verts(&lp), add);
+            }
+            self.status = format!("Selected a loop of {n} edge(s)");
         }
     }
 
@@ -125,7 +218,9 @@ impl AnvilApp {
 
     fn moving_verts(&self, faces: &[Vec<u32>]) -> Vec<u32> {
         let Some(e) = &self.edit else { return Vec::new() };
-        if e.face_mode {
+        if e.edge_mode {
+            crate::edge_loops::edge_verts(&e.edges)
+        } else if e.face_mode {
             let mut v: Vec<u32> = e.faces.iter().filter_map(|f| faces.get(*f)).flatten().copied().collect();
             v.sort_unstable();
             v.dedup();
@@ -135,9 +230,22 @@ impl AnvilApp {
         }
     }
 
-    fn edit_apply_pick(&mut self, vert: Option<u32>, face: Option<usize>, add: bool) {
+    fn edit_apply_pick(&mut self, vert: Option<u32>, face: Option<usize>, edge: Option<[u32; 2]>, add: bool) {
         let Some(e) = self.edit.as_mut() else { return };
-        if e.face_mode {
+        if e.edge_mode {
+            match edge {
+                Some(x) if add => {
+                    if let Some(i) = e.edges.iter().position(|y| *y == x) {
+                        e.edges.remove(i);
+                    } else {
+                        e.edges.push(x);
+                    }
+                }
+                Some(x) => e.edges = vec![x],
+                None if !add => e.edges.clear(),
+                None => {}
+            }
+        } else if e.face_mode {
             match face {
                 Some(f) if add => {
                     if let Some(i) = e.faces.iter().position(|x| *x == f) {
@@ -167,9 +275,18 @@ impl AnvilApp {
     }
 
     /// Makes sure the element under the cursor is selected before a drag.
-    fn edit_ensure_selected(&mut self, vert: Option<u32>, face: Option<usize>, add: bool) {
+    fn edit_ensure_selected(&mut self, vert: Option<u32>, face: Option<usize>, edge: Option<[u32; 2]>, add: bool) {
         let Some(e) = self.edit.as_mut() else { return };
-        if e.face_mode {
+        if e.edge_mode {
+            if let Some(x) = edge {
+                if !e.edges.contains(&x) {
+                    if !add {
+                        e.edges.clear();
+                    }
+                    e.edges.push(x);
+                }
+            }
+        } else if e.face_mode {
             if let Some(f) = face {
                 if !e.faces.contains(&f) {
                     if !add {
@@ -206,7 +323,16 @@ impl AnvilApp {
         let Some((_, world, _, faces)) = self.edit_geometry() else { return };
         let inside = |i: u32| world.get(i as usize).and_then(|w| proj(*w)).is_some_and(|s| r.contains(s));
         let Some(e) = self.edit.as_mut() else { return };
-        if e.face_mode {
+        if e.edge_mode {
+            if !add {
+                e.edges.clear();
+            }
+            for x in crate::edge_loops::unique_edges(&faces) {
+                if inside(x[0]) && inside(x[1]) && !e.edges.contains(&x) {
+                    e.edges.push(x);
+                }
+            }
+        } else if e.face_mode {
             if !add {
                 e.faces.clear();
             }
@@ -237,20 +363,34 @@ impl AnvilApp {
         }
         let Some((rot, world, local, faces)) = self.edit_geometry() else { return };
         let face_mode = self.edit.as_ref().is_some_and(|e| e.face_mode);
+        let edge_mode = self.edit.as_ref().is_some_and(|e| e.edge_mode);
         let proj = |w: Vec3| Some(view.world_to_screen(rect, w));
+        let pick = |p: Pos2| -> (Option<u32>, Option<usize>, Option<[u32; 2]>) {
+            if edge_mode {
+                (None, None, pick_edge(&world, &faces, &proj, p))
+            } else if face_mode {
+                (None, pick_face(&world, &faces, &proj, p), None)
+            } else {
+                (pick_vert(&world, &proj, p), None, None)
+            }
+        };
 
         if resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                let (v, f) = if face_mode { (None, pick_face(&world, &faces, &proj, p)) } else { (pick_vert(&world, &proj, p), None) };
-                self.edit_apply_pick(v, f, add);
+                if mods.alt {
+                    self.edit_loop_pick(pick_edge(&world, &faces, &proj, p), add);
+                } else {
+                    let (v, f, x) = pick(p);
+                    self.edit_apply_pick(v, f, x, add);
+                }
             }
         }
         if resp.drag_started_by(PointerButton::Primary) {
             let start = ctx.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).unwrap_or(rect.center());
             self.drag_cur = start;
-            let (v, f) = if face_mode { (None, pick_face(&world, &faces, &proj, start)) } else { (pick_vert(&world, &proj, start), None) };
-            if v.is_some() || f.is_some() {
-                self.edit_ensure_selected(v, f, add);
+            let (v, f, x) = pick(start);
+            if v.is_some() || f.is_some() || x.is_some() {
+                self.edit_ensure_selected(v, f, x, add);
                 self.push_undo();
                 let origs = self.moving_verts(&faces).into_iter().filter_map(|i| local.get(i as usize).map(|p| (i, *p))).collect();
                 self.drag = Drag::EditMove2D { view: vi, start_uv: view.screen_to_uv(rect, start), origs };
@@ -291,9 +431,13 @@ impl AnvilApp {
         let Some((rot, world, local, faces)) = self.edit_geometry() else { return };
         let Some(obj) = self.edit.as_ref().map(|e| e.obj) else { return };
         let face_mode = self.edit.as_ref().is_some_and(|e| e.face_mode);
+        let edge_mode = self.edit.as_ref().is_some_and(|e| e.edge_mode);
         let proj = |w: Vec3| cam.project(rect, fov, w);
+        let pick_e = |p: Pos2| pick_edge(&world, &faces, &proj, p);
         let pick = |p: Pos2| -> (Option<u32>, Option<usize>, Option<Vec3>) {
-            if face_mode {
+            if edge_mode {
+                (None, None, pick_e(p).and_then(|x| Some((*world.get(x[0] as usize)? + *world.get(x[1] as usize)?) * 0.5)))
+            } else if face_mode {
                 let (o, d) = cam.ray(rect, fov, p);
                 let hit = pick_ray_where(scene, o, d, |w| w.id != obj);
                 let wm = scene.iter().find(|w| w.id == obj);
@@ -309,17 +453,23 @@ impl AnvilApp {
 
         if resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                let (v, f, _) = pick(p);
-                self.edit_apply_pick(v, f, add);
+                if mods.alt {
+                    self.edit_loop_pick(pick_e(p), add);
+                } else {
+                    let (v, f, _) = pick(p);
+                    let x = if edge_mode { pick_e(p) } else { None };
+                    self.edit_apply_pick(v, f, x, add);
+                }
             }
         }
         if resp.drag_started_by(PointerButton::Primary) {
             let start = ctx.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).unwrap_or(rect.center());
             self.drag_cur = start;
             let (v, f, at) = pick(start);
+            let x = if edge_mode { pick_e(start) } else { None };
             match at {
-                Some(at) if v.is_some() || f.is_some() => {
-                    self.edit_ensure_selected(v, f, add);
+                Some(at) if v.is_some() || f.is_some() || x.is_some() => {
+                    self.edit_ensure_selected(v, f, x, add);
                     self.push_undo();
                     let origs = self.moving_verts(&faces).into_iter().filter_map(|i| local.get(i as usize).map(|p| (i, *p))).collect();
                     self.drag = Drag::EditMove3D { plane_y: at.y, start: at, origs };
@@ -361,7 +511,14 @@ impl AnvilApp {
                 }
             }
         }
-        if e.face_mode {
+        if e.edge_mode {
+            for x in crate::edge_loops::unique_edges(&faces) {
+                let (Some(a), Some(b)) = (world.get(x[0] as usize).and_then(|w| proj(*w)), world.get(x[1] as usize).and_then(|w| proj(*w))) else { continue };
+                let sel = e.edges.contains(&x);
+                let stroke = if sel { Stroke::new(3.0f32, Color32::from_rgb(255, 170, 40)) } else { Stroke::new(1.5f32, Color32::from_gray(210)) };
+                painter.line_segment([a, b], stroke);
+            }
+        } else if e.face_mode {
             for (fi, f) in faces.iter().enumerate() {
                 if f.iter().any(|&i| i as usize >= world.len()) {
                     continue;
@@ -485,7 +642,9 @@ impl AnvilApp {
     pub(crate) fn edit_select_all(&mut self) {
         let Some((_, world, _, faces)) = self.edit_geometry() else { return };
         if let Some(e) = &mut self.edit {
-            if e.face_mode {
+            if e.edge_mode {
+                e.edges = crate::edge_loops::unique_edges(&faces);
+            } else if e.face_mode {
                 e.faces = (0..faces.len()).collect();
             } else {
                 e.verts = (0..world.len() as u32).collect();
@@ -496,7 +655,7 @@ impl AnvilApp {
     pub(crate) fn edit_extrude(&mut self) {
         let ok = self.edit.as_ref().is_some_and(|e| e.face_mode && !e.faces.is_empty());
         if !ok {
-            self.status = "Extrude: switch to face mode (2) and select faces".into();
+            self.status = "Extrude: switch to face mode (3) and select faces".into();
             return;
         }
         self.push_undo();
@@ -507,8 +666,21 @@ impl AnvilApp {
 
     pub(crate) fn edit_delete(&mut self) {
         let Some(e) = &self.edit else { return };
-        if e.verts.is_empty() && e.faces.is_empty() {
+        if e.verts.is_empty() && e.faces.is_empty() && e.edges.is_empty() {
             return;
+        }
+        // deleting edges deletes the faces they border
+        if let Some(e) = self.edit.as_mut().filter(|e| e.edge_mode) {
+            let sel = e.edges.clone();
+            let faces: Vec<Vec<u32>> = match self.map.get(e.obj).map(|o| &o.kind) {
+                Some(Kind::Mesh { faces, .. }) => faces.clone(),
+                _ => Vec::new(),
+            };
+            let e = self.edit.as_mut().unwrap();
+            e.faces = (0..faces.len()).filter(|fi| (0..faces[*fi].len()).any(|i| sel.contains(&crate::edge_loops::key(faces[*fi][i], faces[*fi][(i + 1) % faces[*fi].len()])))).collect();
+            e.face_mode = true;
+            e.edge_mode = false;
+            e.edges.clear();
         }
         self.push_undo();
         if let Some(e) = self.edit.clone() {
@@ -525,6 +697,7 @@ impl AnvilApp {
             }
             e.verts.clear();
             e.faces.clear();
+            e.edges.clear();
         });
     }
 
@@ -537,8 +710,8 @@ impl AnvilApp {
     }
 
     pub(crate) fn edit_merge(&mut self) {
-        if self.edit.as_ref().is_none_or(|e| e.verts.len() < 2) {
-            self.status = "Merge: select two or more vertices".into();
+        if self.edit.as_ref().is_none_or(|e| e.verts.len() < 2 || e.face_mode || e.edge_mode) {
+            self.status = "Merge: in vertex mode (1), select two or more vertices".into();
             return;
         }
         self.push_undo();
@@ -558,18 +731,23 @@ impl AnvilApp {
         };
         ui.label(RichText::new(format!("Editing {name}  ({nv} vertices, {nf} faces)")).strong());
         ui.horizontal(|ui| {
-            if ui.selectable_label(!e.face_mode, "1 Vertices").clicked() {
-                self.set_edit_mode(false);
+            if ui.selectable_label(!e.face_mode && !e.edge_mode, "1 Vertices").clicked() {
+                self.set_edit_mode(0);
             }
-            if ui.selectable_label(e.face_mode, "2 Faces").clicked() {
-                self.set_edit_mode(true);
+            if ui.selectable_label(e.edge_mode, "2 Edges").clicked() {
+                self.set_edit_mode(1);
+            }
+            if ui.selectable_label(e.face_mode, "3 Faces").clicked() {
+                self.set_edit_mode(2);
             }
         });
         ui.label(
-            RichText::new(if e.face_mode {
-                format!("{} face(s) selected. Drag a face to move it; E extrudes by one grid step.", e.faces.len())
+            RichText::new(if e.edge_mode {
+                format!("{} edge(s) selected. Drag an edge to move it; Alt+click selects an edge loop.", e.edges.len())
+            } else if e.face_mode {
+                format!("{} face(s) selected. Drag a face to move it; E extrudes by one grid step; Alt+click an edge selects a ring of faces.", e.faces.len())
             } else {
-                format!("{} vertex(es) selected. Drag in 2D views to move (Front/Side for height).", e.verts.len())
+                format!("{} vertex(es) selected. Drag in 2D views to move (Front/Side for height); Alt+click an edge selects its loop.", e.verts.len())
             })
             .small()
             .weak(),
@@ -585,7 +763,7 @@ impl AnvilApp {
                 if ui.button("Flip (N)").clicked() {
                     self.edit_flip();
                 }
-            } else if ui.button("Merge (M)").clicked() {
+            } else if !e.edge_mode && ui.button("Merge (M)").clicked() {
                 self.edit_merge();
             }
             if ui.button("Delete (Del)").clicked() {

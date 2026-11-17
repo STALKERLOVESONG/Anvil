@@ -1,6 +1,6 @@
 [package]
 name = "anvil"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 description = "Anvil - a Hammer-style level editor written in Rust that exports to Roblox Studio, Unity and Blender"
 license = "MIT"

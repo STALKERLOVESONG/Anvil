@@ -3834,3 +3834,83 @@ fn autosaves_dont_overwrite_each_other() {
     assert!(map_file.is_file(), "maps themselves are never touched");
     assert_eq!(ago(std::time::SystemTime::now()), "just now");
 }
+
+/// A tube of quads, 8 around and 3 high: vertex (ring r, around a) = r * 8 + a.
+fn tube_faces() -> Vec<Vec<u32>> {
+    let mut f = Vec::new();
+    for r in 0..3u32 {
+        for a in 0..8u32 {
+            let (a1, r1) = ((a + 1) % 8, r + 1);
+            f.push(vec![r * 8 + a, r * 8 + a1, r1 * 8 + a1, r1 * 8 + a]);
+        }
+    }
+    f
+}
+
+#[test]
+fn alt_click_loops() {
+    use crate::edge_loops::*;
+    let f = tube_faces();
+    assert_eq!(unique_edges(&f).len(), 8 * 4 + 8 * 3, "rings + uprights");
+    // a ring edge in the middle (between around 0 and 1 on ring 1): the loop goes all the way around
+    let around = edge_loop(&f, [8, 9]);
+    assert_eq!(around.len(), 8, "{around:?}");
+    assert!(around.iter().all(|e| e[0] / 8 == 1 && e[1] / 8 == 1), "stays on ring 1: {around:?}");
+    // an upright edge: runs bottom to top, stopping at the open ends
+    let up = edge_loop(&f, [8, 16]);
+    assert_eq!(edge_verts(&up), vec![0, 8, 16, 24], "{up:?}");
+    // a border edge: follows the border all the way round
+    let border = edge_loop(&f, [0, 1]);
+    assert_eq!(border.len(), 8);
+    assert!(border.iter().all(|e| e[0] < 8 && e[1] < 8));
+    // face ring across an upright edge: the whole row of faces around
+    let row = face_ring(&f, [8, 16]);
+    let mut row_sorted = row.clone();
+    row_sorted.sort_unstable();
+    assert_eq!(row_sorted, (8..16).collect::<Vec<usize>>(), "row 1 all the way around: {row:?}");
+    // across a ring edge: the column of faces bottom to top
+    let mut col = face_ring(&f, [8, 9]);
+    col.sort_unstable();
+    assert_eq!(col, vec![0, 8, 16]);
+    // a triangle stops a loop: no endless walking
+    let mut tri = tube_faces();
+    tri.push(vec![0, 1, 99]);
+    assert!(edge_loop(&tri, [8, 9]).len() <= 8);
+}
+
+#[test]
+fn copy_paste_objects() {
+    use crate::clipboard::*;
+    let dir = out_dir("clip");
+    let png = dir.join("c.png");
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 10, 10, 255])).save(&png).unwrap();
+    let mut a = Map::default();
+    let tex = a.add_texture(TextureDef::new("red".into(), png.to_string_lossy().to_string()));
+    let folder = a.add_folder("Stuff", None);
+    let mut b1 = Object::brush(Shape::Box, Vec3::splat(2.0), Vec3::new(5.0, 1.0, 5.0), [255; 3], Material::Brick);
+    b1.texture = Some(tex);
+    b1.folder = Some(folder);
+    let id1 = a.add(b1);
+    let id2 = a.add(Object::brush(Shape::Box, Vec3::splat(2.0), Vec3::new(9.0, 1.0, 5.0), [255; 3], Material::Wood));
+    let text = copy(&a, &[id1, id2]).unwrap();
+    assert!(parse("hello").is_none() && parse("{\"x\":1}").is_none(), "only Anvil's own clipboard text");
+    let clip = parse(&text).unwrap();
+    // into the same map: new objects, same texture, same folder, moved
+    let n_tex = a.textures.len();
+    let ids = paste(&mut a, &clip, Vec3::new(10.0, 0.0, 0.0));
+    assert_eq!(ids.len(), 2);
+    assert!(!ids.contains(&id1) && !ids.contains(&id2));
+    assert_eq!(a.textures.len(), n_tex, "the texture is reused, not doubled");
+    let p1 = a.get(ids[0]).unwrap();
+    assert_eq!(p1.pos, Vec3::new(15.0, 1.0, 5.0));
+    assert_eq!(p1.texture, Some(tex));
+    assert_eq!(p1.folder, Some(folder));
+    // into another map: the texture comes along, the folder doesn't
+    let mut b = Map::default();
+    let ids = paste(&mut b, &clip, Vec3::ZERO);
+    let p = b.get(ids[0]).unwrap();
+    let t = b.texture(p.texture).expect("texture added to the new map");
+    assert_eq!(t.image, png.to_string_lossy());
+    assert_eq!(p.folder, None);
+    assert_eq!(p.pos, Vec3::new(5.0, 1.0, 5.0));
+}
