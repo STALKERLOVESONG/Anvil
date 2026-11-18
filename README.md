@@ -452,6 +452,29 @@ game it can write it into its own folder:
   - It can't change `PATH`-like variables.
   - The first time it wants a program, Anvil asks you with a Yes / No box.
 
+## Building with an AI assistant (MCP)
+
+`anvil.exe --mcp` runs Anvil as a [Model Context Protocol](https://modelcontextprotocol.io)
+server, so an assistant like Claude can build maps for you.
+
+**What it can do:**
+- Make, open and save maps.
+- Lay out buildings from an outline, and cut doors and windows.
+- Add gable, hip or flat roofs.
+- Place boxes, ramps, stairs, props, lights and spawns.
+- Search your mounted Half-Life / GMod content, and import its textures and models.
+- Render a view to check its work.
+
+**Add it to Claude Code** in `~/.claude.json` (it shows up in new sessions):
+
+```json
+"mcpServers": {
+  "anvil": { "type": "stdio", "command": "C:\\path\\to\\anvil.exe", "args": ["--mcp"] }
+}
+```
+
+It edits a map file; open that file in Anvil to see and keep working on it.
+
 ## Saving & sharing
 
 - **Save** (Ctrl+S) writes an `.anvil` map. It's JSON, and it points at your texture and model files where they are on your PC.

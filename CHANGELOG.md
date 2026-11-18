@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.8
+
+- **MCP server (`anvil.exe --mcp`)** so an AI assistant can build maps.
+  - **Maps:** new, open and save.
+  - **Building:** buildings from an outline, door and window cuts, and gable, hip or flat
+    roofs.
+  - **Objects:** brushes, props, lights and spawns.
+  - **Content:** search the mounted Half-Life / GMod content, and import its textures and
+    models.
+  - **Checking:** render a view.
+
 ## 0.2.7
 
 - **Copy and paste:**

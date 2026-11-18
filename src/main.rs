@@ -27,6 +27,7 @@ mod map;
 mod mesh;
 mod mesh_csg;
 mod mesh_openings;
+mod mcp;
 mod play_export;
 mod playtest;
 mod plugin_panels;
@@ -61,6 +62,11 @@ mod tests;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    // `anvil.exe --mcp`: the map-building server for AI assistants (no window)
+    if std::env::args().any(|a| a == "--mcp") {
+        mcp::serve();
+        return Ok(());
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1500.0, 920.0])
         .with_min_inner_size([900.0, 600.0])

@@ -3914,3 +3914,61 @@ fn copy_paste_objects() {
     assert_eq!(p.folder, None);
     assert_eq!(p.pos, Vec3::new(5.0, 1.0, 5.0));
 }
+
+/// The MCP server's tools, called the way an assistant calls them.
+#[test]
+fn mcp_tools_build_a_house() {
+    use serde_json::json;
+    let dir = out_dir("mcp");
+    let path = dir.join("house.anvil");
+    let mut st = None;
+    let mut call = |name: &str, args: serde_json::Value| -> serde_json::Value {
+        let out = crate::mcp::test_call(name, args, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let text = out.iter().find(|c| c["type"] == "text").map(|c| c["text"].as_str().unwrap().to_string()).unwrap_or_default();
+        serde_json::from_str(&text).unwrap_or(json!({ "raw": text, "content": out }))
+    };
+    call("new_map", json!({ "path": path.to_string_lossy() }));
+    let house = call("build_house", json!({ "outline": [[0, 0], [30, 0], [30, 20], [0, 20]], "wall_height": 10 }));
+    let objs = house["objects"].as_array().unwrap();
+    assert_eq!(objs.iter().filter(|o| o["name"].as_str().unwrap().starts_with("Wall")).count(), 4);
+    let wall1 = objs[0]["id"].as_u64().unwrap();
+    let cut = call("cut_opening", json!({ "object_id": wall1, "at": [15, 3, 0], "width": 4, "height": 7, "glass": false }));
+    assert_eq!(cut["cut"], wall1);
+    let roof = call("add_roof", json!({ "kind": "hip", "min": [0, 0], "max": [30, 20], "base_y": 10, "height": 5 }));
+    assert!(roof["id"].as_u64().is_some());
+    let added = call("add_objects", json!({ "objects": [
+        { "kind": "box", "pos": [40, 1, 0], "size": [2, 2, 2], "material": "brick", "name": "Crate", "folder": "Yard" },
+        { "kind": "spawn", "pos": [15, 0.1, -10] },
+        { "kind": "nonsense", "pos": [0, 0, 0] }
+    ] }));
+    assert_eq!(added["ids"].as_array().unwrap().iter().filter(|x| x.is_u64()).count(), 2, "{added}");
+    assert_eq!(added["errors"][0]["index"], 2, "the unknown kind is refused, the rest added: {added}");
+    // the map on disk has it all
+    let m = Map::load(&path).unwrap();
+    assert!(m.objects.iter().any(|o| o.name == "Roof"));
+    let w = m.get(wall1).unwrap();
+    let Kind::Brush { holes, .. } = &w.kind else { panic!() };
+    assert_eq!(holes.len(), 1, "the door is cut");
+    // a render comes back as a picture
+    let out = crate::mcp::test_call("render", json!({ "eye": [-20, 15, -25], "target": [15, 5, 10], "width": 320, "height": 200 }), &mut st).unwrap();
+    assert!(out.iter().any(|c| c["type"] == "image" && c["mimeType"] == "image/png"));
+    // and content search says plainly when nothing is mounted
+    assert!(crate::mcp::test_call("search_content", json!({ "kind": "materials", "query": "brick" }), &mut st).is_err());
+}
+
+/// Roof meshes are closed and every face looks outward (else the renderer
+/// would hide them).
+#[test]
+fn mcp_roofs_face_outward() {
+    for kind in ["gable", "hip", "flat"] {
+        let (v, f) = crate::mcp::test_roof(kind).unwrap();
+        let c = v.iter().copied().sum::<Vec3>() / v.len() as f32;
+        for face in &f {
+            let n = crate::polymesh::newell(&v, face);
+            let fc = face.iter().map(|i| v[*i as usize]).sum::<Vec3>() / face.len() as f32;
+            assert!(n.dot(fc - c) > 0.0, "{kind}: a face looks inward");
+        }
+        let top = v.iter().map(|p| p.y).fold(f32::MIN, f32::max);
+        assert!((top - if kind == "flat" { 10.5 } else { 15.0 }).abs() < 1e-4, "{kind} top {top}");
+    }
+}
