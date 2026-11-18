@@ -10,7 +10,7 @@
 use crate::app::{AnvilApp, Tool};
 use crate::faces_ui::tex_params_ui;
 use crate::map::{FaceTex, Object, TexParams, TextureDef};
-use crate::mesh::{box_uv, local_mesh, rotate_uv, tri_face_key, ModelCache};
+use crate::mesh::{face_uv, local_mesh, rotate_uv, tri_face_key, ModelCache};
 use eframe::egui::{self, pos2, vec2, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, TextureOptions};
 use glam::{Vec2, Vec3};
 
@@ -95,17 +95,24 @@ pub fn rot2(v: Vec2, deg: f32) -> Vec2 {
     Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
+/// A face's own texture axes (faces imported from Source maps), if any.
+fn face_axes(obj: &Object, face: Option<usize>) -> Option<crate::map::UvAxes> {
+    face.and_then(|f| obj.face_tex.get(f)).and_then(|f| f.as_ref()).and_then(|f| f.uv)
+}
+
 /// UVs of the target's triangles exactly as the renderer computes them.
 pub fn target_uvs(obj: &Object, face: Option<usize>, t: &TextureDef, p: &TexParams, models: &mut ModelCache) -> Vec<[Vec2; 3]> {
     let mesh = local_mesh(obj, models);
     let sc = obj.scale();
     let mut out = Vec::new();
     for (ti, tr) in mesh.tris.iter().enumerate() {
-        if face.is_some() && tri_face_key(obj, &mesh, ti) != face {
+        let key = tri_face_key(obj, &mesh, ti);
+        if face.is_some() && key != face {
             continue;
         }
+        let axes = face_axes(obj, key);
         let lp = [mesh.pos[tr[0] as usize] * sc, mesh.pos[tr[1] as usize] * sc, mesh.pos[tr[2] as usize] * sc];
-        let (uv, _, _) = box_uv(lp, t.scale * p.scale, t.offset + p.offset);
+        let (uv, _, _) = face_uv(lp, axes.as_ref(), t.scale * p.scale, t.offset + p.offset);
         out.push(rotate_uv(uv, p.rotation));
     }
     out
@@ -232,7 +239,7 @@ impl AnvilApp {
                 let slot = o.face_tex_mut(f);
                 match slot {
                     Some(ft) => ft.params = p,
-                    None => *slot = Some(FaceTex { texture: tex, params: p }),
+                    None => *slot = Some(FaceTex { texture: tex, params: p, uv: None }),
                 }
             }
             None => o.tex_params = p,
@@ -488,7 +495,8 @@ impl AnvilApp {
         let tr = wm.mesh.tris[h.tri];
         let sc = obj.scale();
         let lp = [wm.mesh.pos[tr[0] as usize] * sc, wm.mesh.pos[tr[1] as usize] * sc, wm.mesh.pos[tr[2] as usize] * sc];
-        let (_, u, v) = box_uv(lp, Vec2::ONE, Vec2::ZERO);
+        let axes = face_axes(&obj, crate::mesh::tri_face_key(&obj, &wm.mesh, h.tri));
+        let (_, u, v) = face_uv(lp, axes.as_ref(), Vec2::ONE, Vec2::ZERO);
         self.push_undo();
         self.uv.vdrag = Some(ViewDrag { target, p0, plane_p: h.point, plane_n: h.normal, inv_rot: obj.rotation().inverse(), u, v, ts: tile(&td, &p0), toff: td.offset, start_x: mouse_x, rotate });
         true

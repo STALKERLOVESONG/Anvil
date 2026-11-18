@@ -513,6 +513,28 @@ installing it.
 Only the props and textures you import are copied to this PC, so it barely uses any space.
 The other PC has to be on while you browse.
 
+## Importing Source maps (.bsp)
+
+**File → Import Source map (.bsp)…** brings a Garry's Mod / Half-Life 2 map into the open
+map, under one folder named after it:
+
+- **Brushes**: every brush is its own editable mesh (Tab to edit, extrude, cut, CSG), and each
+  face keeps its Hammer texture alignment. Faces the game never draws (nodraw, sky, hint)
+  are left off.
+- **Terrain**: displacements become meshes.
+- **Props**: static props and `prop_*` entities become textured props.
+- **Lights and spawns**: lights keep their color and strength; player starts become spawns.
+- **Brush entities** (doors, breakables, `func_brush`…) go in their own folder.
+- **Hidden folders**: clips and invisible walls, and the 3D skybox.
+
+Textures and models come from the map's own packed files first, then from your mounted
+content (see above). The report window lists anything that wasn't found. Mount the game it
+comes from (for example Counter-Strike: Source for `cs_*` / `de_*` textures), then import
+again. The whole import is one undo step.
+
+Supported: VBSP versions 19-21 (Garry's Mod, Half-Life 2, Source SDK 2013). Newer maps with
+compressed data (CS:GO, recent TF2) aren't supported.
+
 ## Export
 
 **Export** window (also in the menu bar):

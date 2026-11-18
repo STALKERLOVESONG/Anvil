@@ -12,6 +12,43 @@ enum Archive {
     Gma(Gma),
 }
 
+/// Something game files can be read from ("materials/x.vmt").
+pub trait Content {
+    fn read(&self, rel: &str) -> Option<Vec<u8>>;
+}
+
+impl Content for Mounts {
+    fn read(&self, rel: &str) -> Option<Vec<u8>> {
+        Mounts::read(self, rel)
+    }
+}
+
+/// A map's own files (its packed zip, a folder next to it) searched before
+/// the mounted games.
+pub struct Layered<'a> {
+    pub files: &'a std::collections::HashMap<String, Vec<u8>>,
+    pub dirs: Vec<PathBuf>,
+    pub base: Option<&'a Mounts>,
+}
+
+impl Content for Layered<'_> {
+    fn read(&self, rel: &str) -> Option<Vec<u8>> {
+        let rel = norm(rel);
+        if let Some(b) = self.files.get(&rel) {
+            return Some(b.clone());
+        }
+        for d in &self.dirs {
+            let p = d.join(&rel);
+            if p.is_file() {
+                if let Ok(b) = std::fs::read(&p) {
+                    return Some(b);
+                }
+            }
+        }
+        self.base.and_then(|m| m.read(&rel))
+    }
+}
+
 /// Everything mounted, searched in order.
 pub struct Mounts {
     dirs: Vec<PathBuf>,
@@ -279,7 +316,7 @@ pub struct MaterialFiles {
 }
 
 /// Follows a material (path under `materials/`, no extension) to its VTFs.
-fn resolve_material(m: &Mounts, mat: &str) -> Option<(String, Option<String>, u8)> {
+fn resolve_material(m: &dyn Content, mat: &str) -> Option<(String, Option<String>, u8)> {
     let mat = norm(mat);
     let mut params = std::collections::HashMap::new();
     let mut shader = String::new();
@@ -316,7 +353,7 @@ fn resolve_material(m: &Mounts, mat: &str) -> Option<(String, Option<String>, u8
     Some((base_vtf, bump, alpha))
 }
 
-fn save_vtf_png(m: &Mounts, vtf_rel: &str, out: &Path) -> Result<(), String> {
+fn save_vtf_png(m: &dyn Content, vtf_rel: &str, out: &Path) -> Result<(), String> {
     if out.is_file() {
         return Ok(()); // already imported
     }
@@ -332,13 +369,13 @@ fn save_vtf_png(m: &Mounts, vtf_rel: &str, out: &Path) -> Result<(), String> {
 }
 
 /// Decodes a material's base texture for previews.
-pub fn preview_material(m: &Mounts, mat: &str, max_dim: u32) -> Result<source::Rgba, String> {
+pub fn preview_material(m: &dyn Content, mat: &str, max_dim: u32) -> Result<source::Rgba, String> {
     let (vtf, _, _) = resolve_material(m, mat).ok_or_else(|| format!("{mat}: no base texture found"))?;
     decode_vtf(&m.read(&vtf).ok_or("texture missing")?, max_dim)
 }
 
 /// Converts a material into PNG files under `content/materials/`.
-pub fn import_material(m: &Mounts, mat: &str) -> Result<MaterialFiles, String> {
+pub fn import_material(m: &dyn Content, mat: &str) -> Result<MaterialFiles, String> {
     let mat = norm(mat);
     let (base, bump, alpha) = resolve_material(m, &mat).ok_or_else(|| format!("{mat}: no base texture found"))?;
     let translucent = alpha > 0;
@@ -358,7 +395,7 @@ pub fn import_material(m: &Mounts, mat: &str) -> Result<MaterialFiles, String> {
 
 /// Converts a model (and its textures) into an OBJ + MTL + PNGs under
 /// `content/models/`. `scale` converts Source units to editor units.
-pub fn import_model(m: &Mounts, mdl: &str, scale: f32) -> Result<PathBuf, String> {
+pub fn import_model(m: &dyn Content, mdl: &str, scale: f32) -> Result<PathBuf, String> {
     let rel = norm(mdl);
     let model = load_mdl(&|r| m.read(r), &rel)?;
     let dir = content_dir();

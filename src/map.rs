@@ -257,6 +257,18 @@ pub struct FaceTex {
     pub texture: Option<u64>,
     #[serde(default)]
     pub params: TexParams,
+    /// Exact planar mapping (faces imported from Source / Hammer maps):
+    /// `uv = ((P.u + offset.x) / tile.x, (P.v + offset.y) / tile.y)` with
+    /// `P = (p . u, p . v)` for an object-space point `p`. None = box mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uv: Option<UvAxes>,
+}
+
+/// Texture axes of one face in object space (see `FaceTex::uv`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UvAxes {
+    pub u: Vec3,
+    pub v: Vec3,
 }
 
 /// Source of a 3D text mesh, so it can be rebuilt (the mesh itself is saved,

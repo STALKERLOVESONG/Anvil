@@ -405,6 +405,29 @@ impl Server {
                 });
                 Ok(json!({ "model": p, "bounds_at_scale_1": size, "note": "place it with add_objects kind prop, model = this path; pos is the model's origin (usually its base)" }))
             }
+            "import_bsp" => {
+                let p = std::path::PathBuf::from(s(a, "path"));
+                let ext_ok = p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("bsp"));
+                if !ext_ok || !p.is_file() || crate::texture::is_network_path(&p.to_string_lossy()) {
+                    return Err("path must be a .bsp file on this PC".into());
+                }
+                let opts = crate::bsp::Options {
+                    scale: f(a, "scale", self.settings.source_scale),
+                    spawn_size: self.settings.spawn_size,
+                    props: a.get("props").and_then(|x| x.as_bool()).unwrap_or(true),
+                };
+                let _ = self.mounts();
+                let imp = crate::bsp::import(&p, self.mounts.as_ref(), &opts, &|_| {})?;
+                let report = imp.report.clone();
+                let ids = crate::bsp::apply(&mut self.map, imp);
+                Ok(json!({
+                    "objects": ids.len(),
+                    "summary": report.summary(),
+                    "missing_materials": report.missing_materials.iter().take(40).collect::<Vec<_>>(),
+                    "missing_models": report.missing_models.iter().take(40).collect::<Vec<_>>(),
+                    "warnings": report.warnings,
+                }))
+            }
             "model_bounds" => {
                 let p = s(a, "model").to_string();
                 let m = self.models.get(&p)?;
@@ -531,6 +554,7 @@ fn tools() -> Value {
         { "name": "set_texture_scale", "description": "A texture's tiling (studs_per_tile: units one tile covers, default 8) and transparency (alpha: solid | cutout | see_through; imported GMod materials get theirs set already).", "inputSchema": obj(json!({ "texture_id": { "type": "integer" }, "studs_per_tile": { "type": "number" }, "alpha": { "type": "string", "enum": ["solid", "cutout", "see_through"] } }), &["texture_id"]) },
         { "name": "add_texture_file", "description": "Add an image file on this PC as a texture.", "inputSchema": obj(json!({ "path": { "type": "string" }, "name": { "type": "string" } }), &["path"]) },
         { "name": "import_model", "description": "Convert a mounted .mdl (from search_content) into a textured OBJ and return its path (and size) for add_objects kind prop.", "inputSchema": obj(json!({ "model": { "type": "string" }, "scale": { "type": "number" } }), &["model"]) },
+        { "name": "import_bsp", "description": "Import a Source engine map (.bsp from Garry's Mod / Half-Life 2) into the open map: brushes become editable meshes with their textures, plus terrain, props, lights and spawns, under one folder named after the map.", "inputSchema": obj(json!({ "path": { "type": "string" }, "scale": { "type": "number" }, "props": { "type": "boolean" } }), &["path"]) },
         { "name": "model_bounds", "description": "A model file's size (at scale 1).", "inputSchema": obj(json!({ "model": { "type": "string" } }), &["model"]) },
         { "name": "render", "description": "Render the map from eye [x,y,z] looking at target [x,y,z] (Anvil's 3D view, lit) and return the picture.", "inputSchema": obj(json!({ "eye": xyz, "target": xyz, "width": { "type": "number" }, "height": { "type": "number" }, "fov": { "type": "number" }, "lighting": { "type": "integer", "description": "0 flat .. 4 best" } }), &["eye", "target"]) },
     ])

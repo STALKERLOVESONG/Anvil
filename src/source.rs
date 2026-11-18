@@ -44,7 +44,9 @@ pub fn norm(p: &str) -> String {
     let s = s.trim_start_matches('/');
     let mut out = String::with_capacity(s.len());
     for part in s.split('/') {
-        if part.is_empty() || part == "." {
+        // ".." and drive letters / streams ("c:", "x:y") could point outside
+        // the content folder when a path from a map or addon becomes a file name
+        if part.is_empty() || part == "." || part == ".." || part.contains(':') {
             continue;
         }
         if !out.is_empty() {

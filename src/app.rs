@@ -271,6 +271,8 @@ pub struct AnvilApp {
     pub(crate) show_content: bool,
     pub(crate) mounts: Option<Arc<crate::mount::Mounts>>,
     pub(crate) mounts_rx: Option<Receiver<crate::mount::Mounts>>,
+    pub(crate) bsp_job: Option<crate::bsp_ui::BspJob>,
+    pub(crate) bsp_report: Option<crate::bsp_ui::BspReport>,
     pub(crate) content_search: String,
     pub(crate) content_tab_models: bool,
     pub(crate) content_filtered: Vec<String>,
@@ -562,6 +564,8 @@ impl AnvilApp {
             show_content: false,
             mounts: None,
             mounts_rx: None,
+            bsp_job: None,
+            bsp_report: None,
             content_search: String::new(),
             content_tab_models: true,
             content_filtered: Vec::new(),
@@ -1870,6 +1874,14 @@ impl AnvilApp {
                     if ui.button("Half-Life / Source content…").clicked() {
                         ui.close_menu();
                         self.open_content();
+                    }
+                    if ui
+                        .button("Import Source map (.bsp)…")
+                        .on_hover_text("Bring a Garry's Mod / Half-Life 2 map in: every brush becomes an editable mesh with its textures, plus terrain, props, lights and spawns")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.import_bsp_dialog();
                     }
                     ui.separator();
                     if ui.button("Export…").clicked() {
@@ -4094,6 +4106,7 @@ impl eframe::App for AnvilApp {
         }
         self.poll_cloud(ctx);
         self.poll_mounts(ctx);
+        self.poll_bsp_import(ctx);
         self.poll_team(ctx);
         self.poll_live();
         self.poll_blend(ctx);
@@ -4117,6 +4130,7 @@ impl eframe::App for AnvilApp {
             self.menu_bar(ctx);
             self.update_banner(ctx);
             self.restore_banner(ctx);
+            self.bsp_report_window(ctx);
             self.status_bar(ctx);
             self.library_panel(ctx);
             self.right_panel(ctx);

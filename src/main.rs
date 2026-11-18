@@ -5,6 +5,8 @@ mod autosave;
 mod clipboard;
 mod branding;
 mod blender_export;
+mod bsp;
+mod bsp_ui;
 mod building;
 mod content_ui;
 mod cloud;

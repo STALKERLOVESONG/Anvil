@@ -695,6 +695,10 @@ mod source_content {
     fn reads_real_hl2_oil_drum() {
         let Some(g) = gmod() else { return };
         let mounts = Mounts::build(&[g.clone()]);
+        if mounts.read("models/props_c17/oildrum001.mdl").is_none() {
+            eprintln!("no Half-Life 2 content mounted here; skipped");
+            return;
+        }
         assert!(mounts.models.iter().any(|m| m == "models/props_c17/oildrum001.mdl"), "oil drum not indexed; mounts: {:?}", mounts.summary);
         assert!(mounts.materials.iter().any(|m| m == "models/props_c17/oil_drum001a"));
 
@@ -1008,7 +1012,7 @@ mod faces_and_views {
         let (mut map, a, b) = textures(&dir);
         let mut wall = Object::brush(Shape::Box, Vec3::new(8.0, 6.0, 1.0), Vec3::new(0.0, 3.0, 0.0), [255, 255, 255], Material::Brick);
         wall.texture = Some(a);
-        *wall.face_tex_mut(4) = Some(FaceTex { texture: Some(b), params: TexParams { tint: [220, 40, 40], ..TexParams::default() } });
+        *wall.face_tex_mut(4) = Some(FaceTex { texture: Some(b), params: TexParams { tint: [220, 40, 40], ..TexParams::default() }, uv: None });
         let id = map.add(wall);
 
         // preview: two texture slots, the +Z face uses the striped one
@@ -1092,7 +1096,7 @@ mod faces_and_views {
         let walls = crate::building::house_walls(&[Vec3::new(-10.0, 0.0, -8.0), Vec3::new(10.0, 0.0, -8.0), Vec3::new(10.0, 0.0, 8.0), Vec3::new(-10.0, 0.0, 8.0)], 1.0, 8.0, 0.0, [255, 255, 255], Material::Brick);
         for mut w in walls {
             w.texture = Some(a);
-            *w.face_tex_mut(2) = Some(FaceTex { texture: Some(b), params: TexParams { tint: [220, 60, 50], ..TexParams::default() } });
+            *w.face_tex_mut(2) = Some(FaceTex { texture: Some(b), params: TexParams { tint: [220, 60, 50], ..TexParams::default() }, uv: None });
             map.add(w);
         }
         let scene = crate::mesh::build_scene(&map, &mut ModelCache::default());
@@ -1182,7 +1186,7 @@ mod knife {
     fn diagonal_cut_makes_two_closed_meshes_with_face_textures() {
         let mut o = Object::brush(Shape::Box, Vec3::new(4.0, 4.0, 4.0), Vec3::new(0.0, 2.0, 0.0), [200; 3], Material::Concrete);
         o.rot = Vec3::new(0.0, 30.0, 0.0);
-        let tex = FaceTex { texture: Some(7), params: TexParams::default() };
+        let tex = FaceTex { texture: Some(7), params: TexParams::default(), uv: None };
         *o.face_tex_mut(2) = Some(tex.clone()); // +Y top
         let (mut m, id) = one(o.clone());
         let n = Vec3::new(1.0, 0.0, 1.0).normalize();
@@ -4006,4 +4010,412 @@ fn cut_out_and_see_through_textures() {
     assert!(!red(l) && red(r), "cut-out: the wall shows through the transparent half ({l:?} {r:?})");
     let (l, r) = shot("newmtl a\nmap_Kd half.png\nmap_d half.png\nd 0.999\n");
     assert!(!red(l) && red(r), "see-through: the same, blended ({l:?} {r:?})");
+}
+
+
+// ---------------------------------------------------------------------------
+// Source map (.bsp) import
+// ---------------------------------------------------------------------------
+
+mod bsp_import {
+    use crate::bsp::{self, Bsp, Options};
+    use crate::map::{Kind, Map};
+    use crate::mount::Layered;
+    use glam::{DVec3, Vec3};
+    use std::collections::HashMap;
+    use std::io::Write;
+
+    fn put_f(v: &mut Vec<u8>, x: f32) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn put_i(v: &mut Vec<u8>, x: i32) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn put_u16(v: &mut Vec<u8>, x: u16) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn put_v(v: &mut Vec<u8>, p: [f32; 3]) {
+        p.iter().for_each(|x| put_f(v, *x));
+    }
+
+    /// A 2x2 RGBA texture as a VTF 7.2 file.
+    fn tiny_vtf(w: u16, h: u16) -> Vec<u8> {
+        let mut v = b"VTF\0".to_vec();
+        put_i(&mut v, 7);
+        put_i(&mut v, 2);
+        put_i(&mut v, 80); // header size
+        put_u16(&mut v, w);
+        put_u16(&mut v, h);
+        put_i(&mut v, 0); // flags
+        put_u16(&mut v, 1); // frames
+        put_u16(&mut v, 0);
+        v.extend_from_slice(&[0; 4]);
+        put_v(&mut v, [0.5; 3]);
+        v.extend_from_slice(&[0; 4]);
+        put_f(&mut v, 1.0);
+        put_i(&mut v, 0); // RGBA8888
+        v.push(1); // mips
+        put_i(&mut v, -1); // no low-res image
+        v.extend_from_slice(&[0, 0]);
+        put_u16(&mut v, 1); // depth
+        v.resize(80, 0);
+        for i in 0..(w as usize * h as usize) {
+            v.extend_from_slice(if i % 2 == 0 { &[255, 0, 0, 255] } else { &[0, 0, 255, 255] });
+        }
+        v
+    }
+
+    /// The six planes of a box (outward normals).
+    fn box_planes(mn: [f32; 3], mx: [f32; 3]) -> Vec<([f32; 3], f32)> {
+        vec![
+            ([1.0, 0.0, 0.0], mx[0]),
+            ([-1.0, 0.0, 0.0], -mn[0]),
+            ([0.0, 1.0, 0.0], mx[1]),
+            ([0.0, -1.0, 0.0], -mn[1]),
+            ([0.0, 0.0, 1.0], mx[2]),
+            ([0.0, 0.0, -1.0], -mn[2]),
+        ]
+    }
+
+    pub const S: [f32; 4] = [0.6, 0.8, 0.0, 13.0];
+    pub const T: [f32; 4] = [0.0, 0.3, -1.25, 7.0];
+
+    /// A small map with: a textured world brush (bottom nodraw), a player
+    /// clip, a displacement over its brush, a func_breakable (model *1 at
+    /// origin 500 0 0), a light, a spawn, a missing prop and a packed texture.
+    pub fn synthetic_bsp() -> Vec<u8> {
+        let mut planes = Vec::new();
+        let mut sides = Vec::new(); // (plane, texinfo)
+        let mut brushes = Vec::new(); // (first, num, contents)
+        let mut add_brush = |planes: &mut Vec<([f32; 3], f32)>, mn: [f32; 3], mx: [f32; 3], tex: [i16; 6], contents: i32| {
+            let first = sides.len();
+            for (i, p) in box_planes(mn, mx).into_iter().enumerate() {
+                planes.push(p);
+                sides.push((planes.len() as u16 - 1, tex[i]));
+            }
+            brushes.push((first as i32, 6, contents));
+        };
+        add_brush(&mut planes, [0.0, 0.0, 0.0], [128.0, 64.0, 32.0], [0, 0, 0, 0, 0, 1], 1); // world, bottom nodraw
+        add_brush(&mut planes, [0.0, 100.0, 0.0], [64.0, 116.0, 64.0], [2; 6], 0x10000); // player clip
+        add_brush(&mut planes, [-16.0, -16.0, 0.0], [16.0, 16.0, 48.0], [0; 6], 1); // func_breakable, local
+        add_brush(&mut planes, [200.0, 0.0, -16.0], [328.0, 128.0, 0.0], [1, 1, 1, 1, 0, 1], 1); // displacement's brush
+        // the displacement face: the top of the last brush
+        let disp_plane = planes.len() as u16 - 2; // +Z of the last box
+        let verts: Vec<[f32; 3]> = vec![[200.0, 0.0, 0.0], [328.0, 0.0, 0.0], [328.0, 128.0, 0.0], [200.0, 128.0, 0.0]];
+
+        let mut l: Vec<Vec<u8>> = vec![Vec::new(); 64];
+        let ents = concat!(
+            "{\n\"classname\" \"worldspawn\"\n}\n",
+            "{\n\"classname\" \"light\"\n\"origin\" \"10 20 30\"\n\"_light\" \"255 128 0 400\"\n}\n",
+            "{\n\"classname\" \"info_player_start\"\n\"origin\" \"1 2 3\"\n\"angles\" \"0 90 0\"\n}\n",
+            "{\n\"classname\" \"func_breakable\"\n\"model\" \"*1\"\n\"origin\" \"500 0 0\"\n\"targetname\" \"crate\"\n}\n",
+            "{\n\"classname\" \"prop_physics\"\n\"model\" \"models/nothing/here.mdl\"\n\"origin\" \"0 0 0\"\n}\n",
+        );
+        l[0] = ents.as_bytes().to_vec();
+        l[0].push(0);
+        for (n, d) in &planes {
+            put_v(&mut l[1], *n);
+            put_f(&mut l[1], *d);
+            put_i(&mut l[1], 0);
+        }
+        // texdata strings
+        let names = ["test/checker", "TOOLS/TOOLSNODRAW", "tools/toolsplayerclip"];
+        for n in names {
+            let at = l[43].len() as i32;
+            put_i(&mut l[44], at);
+            l[43].extend_from_slice(n.as_bytes());
+            l[43].push(0);
+        }
+        for (i, (w, h)) in [(64, 32), (64, 64), (64, 64)].into_iter().enumerate() {
+            put_v(&mut l[2], [0.5; 3]);
+            put_i(&mut l[2], i as i32);
+            put_i(&mut l[2], w);
+            put_i(&mut l[2], h);
+            put_i(&mut l[2], w);
+            put_i(&mut l[2], h);
+        }
+        // texinfo: 0 textured, 1 nodraw, 2 player clip
+        for (i, flags) in [0, 0x80, 0].into_iter().enumerate() {
+            S.iter().for_each(|x| put_f(&mut l[6], *x));
+            T.iter().for_each(|x| put_f(&mut l[6], *x));
+            l[6].extend_from_slice(&[0; 32]);
+            put_i(&mut l[6], flags);
+            put_i(&mut l[6], i as i32);
+        }
+        for v in &verts {
+            put_v(&mut l[3], *v);
+        }
+        for e in [[0u16, 1], [1, 2], [2, 3], [3, 0]] {
+            put_u16(&mut l[12], 0);
+            put_u16(&mut l[12], 0);
+            let _ = e;
+        }
+        l[12].clear();
+        put_u16(&mut l[12], 0);
+        put_u16(&mut l[12], 0); // edge 0 unused
+        for e in [[0u16, 1], [1, 2], [2, 3], [3, 0]] {
+            put_u16(&mut l[12], e[0]);
+            put_u16(&mut l[12], e[1]);
+        }
+        for i in 1..=4 {
+            put_i(&mut l[13], i);
+        }
+        // face 0: the displacement
+        put_u16(&mut l[7], disp_plane);
+        l[7].extend_from_slice(&[0, 0]);
+        put_i(&mut l[7], 0);
+        put_u16(&mut l[7], 4);
+        put_u16(&mut l[7], 0); // texinfo
+        put_u16(&mut l[7], 0); // dispinfo
+        l[7].resize(56, 0);
+        for (f, n, c) in &brushes {
+            put_i(&mut l[18], *f);
+            put_i(&mut l[18], *n);
+            put_i(&mut l[18], *c);
+        }
+        for (p, t) in &sides {
+            put_u16(&mut l[19], *p);
+            put_u16(&mut l[19], *t as u16);
+            put_u16(&mut l[19], 0); // compilers leave 0 here
+            l[19].extend_from_slice(&[0, 0]);
+        }
+        // models: 0 world (node 0), 1 func_breakable (node 1)
+        for (head, ff, nf) in [(0, 0, 1), (1, 1, 0)] {
+            put_v(&mut l[14], [-1.0; 3]);
+            put_v(&mut l[14], [1.0; 3]);
+            put_v(&mut l[14], [0.0; 3]);
+            put_i(&mut l[14], head);
+            put_i(&mut l[14], ff);
+            put_i(&mut l[14], nf);
+        }
+        // nodes: 0 -> leaf 0 / leaf 1 split on x = 150, 1 -> leaf 2
+        for (plane, kids) in [(0, [-1, -2]), (0, [-3, -3])] {
+            put_i(&mut l[5], plane);
+            put_i(&mut l[5], kids[0]);
+            put_i(&mut l[5], kids[1]);
+            l[5].extend_from_slice(&[0; 20]);
+        }
+        // leafs (version 1, 32 bytes): (area, first leafbrush, count)
+        for (area, first, n) in [(1u16, 0u16, 2u16), (1, 2, 1), (0, 3, 1)] {
+            let mut r = vec![0u8; 32];
+            r[6..8].copy_from_slice(&area.to_le_bytes());
+            r[24..26].copy_from_slice(&first.to_le_bytes());
+            r[26..28].copy_from_slice(&n.to_le_bytes());
+            l[10].extend_from_slice(&r);
+        }
+        for b in [0u16, 1, 3, 2] {
+            put_u16(&mut l[17], b);
+        }
+        // dispinfo 0: power 2 (5x5), its face is face 0
+        let mut d = vec![0u8; 176];
+        d[0..12].copy_from_slice(&[200.0f32, 0.0, 0.0].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>());
+        d[20..24].copy_from_slice(&2i32.to_le_bytes());
+        d[36..38].copy_from_slice(&0u16.to_le_bytes());
+        l[26] = d;
+        for y in 0..5 {
+            for x in 0..5 {
+                put_v(&mut l[33], [0.0, 0.0, 1.0]);
+                put_f(&mut l[33], (x * 4 + y) as f32);
+                put_f(&mut l[33], 0.0);
+            }
+        }
+        // packed files
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        z.start_file("materials/test/checker.vmt", o).unwrap();
+        z.write_all(b"\"LightmappedGeneric\"\n{\n\"$basetexture\" \"test/checker\"\n}\n").unwrap();
+        z.start_file("materials/test/checker.vtf", o).unwrap();
+        z.write_all(&tiny_vtf(2, 2)).unwrap();
+        z.start_file("../../escape.vmt", o).unwrap();
+        z.write_all(b"x").unwrap();
+        l[40] = z.finish().unwrap().into_inner();
+
+        // the file
+        let mut out = b"VBSP".to_vec();
+        put_i(&mut out, 20);
+        let mut data = Vec::new();
+        let base = 8 + 64 * 16 + 4;
+        let mut table = Vec::new();
+        for (i, lump) in l.iter().enumerate() {
+            put_i(&mut table, (base + data.len()) as i32);
+            put_i(&mut table, lump.len() as i32);
+            put_i(&mut table, if i == 10 { 1 } else { 0 });
+            put_i(&mut table, 0);
+            data.extend_from_slice(lump);
+            while data.len() % 4 != 0 {
+                data.push(0);
+            }
+        }
+        out.extend_from_slice(&table);
+        put_i(&mut out, 1);
+        out.extend_from_slice(&data);
+        out
+    }
+
+    fn import(b: &[u8]) -> bsp::Imported {
+        let bsp = Bsp::parse(b).unwrap();
+        let content = Layered { files: &bsp.pak, dirs: Vec::new(), base: None };
+        let opts = Options { scale: 0.07, spawn_size: Vec3::new(6.0, 0.2, 6.0), props: true };
+        bsp::import_parsed(&bsp, "synthetic", &content, &opts, &|_| {}).unwrap()
+    }
+
+    #[test]
+    fn bsp_brushes_become_textured_meshes() {
+        let b = synthetic_bsp();
+        let parsed = Bsp::parse(&b).unwrap();
+        assert!(parsed.pak.contains_key("materials/test/checker.vtf"));
+        assert!(parsed.pak.keys().all(|k| !k.contains("..")), "packed names can't climb out: {:?}", parsed.pak.keys().collect::<Vec<_>>());
+        let imp = import(&b);
+        let r = &imp.report;
+        assert_eq!((r.brushes, r.brush_entities, r.hidden, r.displacements, r.lights, r.spawns, r.textures), (1, 1, 1, 1, 1, 1, 1), "{r:?}");
+        assert_eq!(r.missing_models, vec!["models/nothing/here.mdl".to_string()]);
+
+        // the world brush: 5 faces (the nodraw bottom is gone), all textured with their own axes
+        let (world, _) = imp.objects.iter().find(|(_, g)| *g == bsp::Group::World).unwrap();
+        let Kind::Mesh { verts, faces } = &world.kind else { panic!() };
+        assert_eq!(faces.len(), 5);
+        assert_eq!(verts.len(), 8);
+        assert!(world.face_tex.iter().all(|f| f.as_ref().is_some_and(|f| f.uv.is_some() && f.texture == Some(0))));
+        let k = 0.07;
+        let size = verts.iter().fold(Vec3::splat(f32::MIN), |a, v| a.max(*v)) * 2.0;
+        assert!((size - Vec3::new(128.0, 32.0, 64.0) * k).abs().max_element() < 1e-3, "{size}");
+        // faces face outward
+        for f in faces {
+            let n = crate::polymesh::newell(verts, f);
+            let c = crate::polymesh::face_center(verts, f);
+            assert!(n.dot(c) > 0.0, "face {f:?} points inward");
+        }
+
+        // add to a map and check the texture lines up exactly like in Source
+        let mut map = Map::default();
+        let ids = bsp::apply(&mut map, imp);
+        assert_eq!(map.textures.len(), 1);
+        let tex = &map.textures[0];
+        assert!(std::path::Path::new(&tex.image).is_file());
+        let o = map.get(ids[0]).unwrap();
+        let mut cache = crate::mesh::ModelCache::default();
+        let wm = crate::mesh::world_mesh(o, &map.textures, &mut cache);
+        let (w, h) = (64.0, 32.0);
+        let mut checked = 0;
+        for (ti, t) in wm.mesh.tris.iter().enumerate() {
+            for c in 0..3 {
+                let p = wm.pos[t[c] as usize];
+                let src = DVec3::new(p.x as f64, -(p.z as f64), p.y as f64) / k as f64;
+                let su = (src.x * S[0] as f64 + src.y * S[1] as f64 + src.z * S[2] as f64 + S[3] as f64) / w;
+                let sv = (src.x * T[0] as f64 + src.y * T[1] as f64 + src.z * T[2] as f64 + T[3] as f64) / h;
+                let uv = wm.tri_uv[ti][c];
+                assert!((uv.x as f64 - su).abs() < 2e-3 && (uv.y as f64 - sv).abs() < 2e-3, "uv {uv} vs Source ({su}, {sv}) at {src}");
+                checked += 1;
+            }
+        }
+        assert!(checked >= 30);
+
+        // folders
+        let root = map.folders.iter().find(|f| f.name == "synthetic").unwrap().id;
+        for name in ["World", "Terrain (displacements)", "Brush entities", "Lights", "Spawns", "Clips and invisible walls (hidden)"] {
+            assert!(map.folders.iter().any(|f| f.name == name && f.parent == Some(root)), "folder {name}");
+        }
+        assert!(map.objects.iter().all(|o| o.folder.is_some()));
+    }
+
+    #[test]
+    fn bsp_terrain_entities_and_clips() {
+        let imp = import(&synthetic_bsp());
+        let k = 0.07f32;
+        let get = |g: bsp::Group| imp.objects.iter().filter(move |(_, og)| *og == g).map(|(o, _)| o);
+
+        // terrain: a 5x5 grid raised by the displacement distances
+        let t = get(bsp::Group::Terrain).next().unwrap();
+        let Kind::Mesh { verts, faces } = &t.kind else { panic!() };
+        assert_eq!((verts.len(), faces.len()), (25, 16));
+        let top = verts.iter().map(|v| v.y + t.pos.y).fold(f32::MIN, f32::max);
+        assert!((top - 20.0 * k).abs() < 1e-3, "highest point {top}");
+        for f in faces {
+            assert!(crate::polymesh::newell(verts, f).y > 0.0, "terrain faces up");
+        }
+        // the displacement's own brush isn't imported as a block
+        assert!(get(bsp::Group::World).all(|o| o.pos.x < 150.0 * k));
+
+        // the breakable sits at its entity origin
+        let e = get(bsp::Group::BrushEntities).next().unwrap();
+        assert!((e.pos - Vec3::new(500.0, 24.0, 0.0) * k).length() < 1e-3, "{}", e.pos);
+        assert!(e.name.starts_with("crate"));
+
+        // the clip is kept, hidden, and still solid
+        let c = get(bsp::Group::Hidden).next().unwrap();
+        assert!(c.hidden && c.collide);
+
+        // light: color, brightness from its intensity, position
+        let l = get(bsp::Group::Lights).next().unwrap();
+        assert_eq!(l.color, [255, 128, 0]);
+        assert!((l.pos - Vec3::new(10.0, 30.0, -20.0) * k).length() < 1e-4);
+        let Kind::Light { brightness, range } = l.kind else { panic!() };
+        assert!((brightness - 2.0 * 2f32.sqrt()).abs() < 1e-3 && range > 10.0);
+
+        // spawn faces the way the Source one did (yaw 90 = Source +Y = Anvil -Z)
+        let s = get(bsp::Group::Spawns).next().unwrap();
+        let fwd = s.rotation() * Vec3::X;
+        assert!((fwd - Vec3::NEG_Z).length() < 1e-4, "{fwd}");
+        assert!((s.pos.x - k).abs() < 1e-4 && (s.pos.z + 2.0 * k).abs() < 1e-4);
+    }
+
+    #[test]
+    fn bsp_rotations_match_source() {
+        // pitch 90 points Source's forward (+X) down
+        let q = bsp::source_rotation(DVec3::new(90.0, 0.0, 0.0));
+        assert!((q * Vec3::X - Vec3::NEG_Y).length() < 1e-4);
+        // yaw 90 turns +X to Source +Y (Anvil -Z); roll 90 turns Source +Y (left) up
+        let q = bsp::source_rotation(DVec3::new(0.0, 0.0, 90.0));
+        assert!((q * Vec3::NEG_Z - Vec3::Y).length() < 1e-4);
+    }
+
+    #[test]
+    fn bsp_broken_files_dont_crash() {
+        let good = synthetic_bsp();
+        assert!(Bsp::parse(b"VBSP").is_err());
+        assert!(Bsp::parse(&good[..500]).is_err());
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..400 {
+            let mut b = good.clone();
+            for _ in 0..1 + round % 16 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let i = (seed as usize) % b.len();
+                b[i] = (seed >> 32) as u8;
+            }
+            if let Ok(bsp) = Bsp::parse(&b) {
+                let content = Layered { files: &bsp.pak, dirs: Vec::new(), base: None };
+                let opts = Options { scale: 0.07, spawn_size: Vec3::ONE, props: false };
+                let _ = bsp::import_parsed(&bsp, "x", &content, &opts, &|_| {});
+            }
+        }
+        // a lump pointing past the end is an error, not a crash
+        let mut b = good.clone();
+        b[8 + 16..8 + 20].copy_from_slice(&i32::MAX.to_le_bytes());
+        let _ = Bsp::parse(&b);
+    }
+
+    #[test]
+    fn game_paths_cant_escape() {
+        assert_eq!(crate::source::norm("materials/../../../windows/x"), "materials/windows/x");
+        assert_eq!(crate::source::norm("C:/Users/x"), "users/x");
+        assert_eq!(crate::source::norm("a/b:c/d"), "a/d");
+    }
+
+    /// The user's test map, with whatever content is mounted.
+    #[test]
+    #[ignore]
+    fn real_bsp_imports() {
+        let p = std::path::Path::new(r"C:\Users\Bearf\Downloads\gm_low_budget_abandoned_town\gm_low_budget_abandoned_town.bsp");
+        let m = crate::mount::Mounts::build(&crate::settings::Settings::load().mounts);
+        let opts = Options { scale: 0.07, spawn_size: Vec3::new(6.0, 0.2, 6.0), props: true };
+        let t = std::time::Instant::now();
+        let imp = bsp::import(p, Some(&m), &opts, &|s| eprintln!("{s}")).unwrap();
+        eprintln!("{} in {:?}", imp.report.summary(), t.elapsed());
+        assert!(imp.report.brushes > 100);
+        assert_eq!(imp.report.spawns, 12);
+        assert_eq!(imp.report.lights, 9);
+        let _ = HashMap::<u8, u8>::new();
+    }
 }

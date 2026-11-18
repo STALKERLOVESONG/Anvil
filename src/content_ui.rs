@@ -51,7 +51,7 @@ impl AnvilApp {
 
     fn import_model(&mut self, rel: &str) {
         let Some(m) = self.mounts.clone() else { return };
-        match mount::import_model(&m, rel, self.settings.source_scale) {
+        match mount::import_model(&*m, rel, self.settings.source_scale) {
             Ok(obj) => {
                 let path = obj.to_string_lossy().to_string();
                 self.models.forget(&path);
@@ -71,7 +71,7 @@ impl AnvilApp {
 
     fn import_material(&mut self, rel: &str, apply: bool, decal: bool) {
         let Some(m) = self.mounts.clone() else { return };
-        match mount::import_material(&m, rel) {
+        match mount::import_material(&*m, rel) {
             Ok(f) => {
                 self.push_undo();
                 let id = match self.map.textures.iter().find(|t| t.image == f.image) {
@@ -305,7 +305,7 @@ impl AnvilApp {
         if let Some(s) = select {
             if !self.content_tab_models {
                 if let Some(m) = self.mounts.clone() {
-                    match mount::preview_material(&m, &s, 256) {
+                    match mount::preview_material(&*m, &s, 256) {
                         Ok(img) => {
                             let ci = egui::ColorImage::from_rgba_unmultiplied([img.w as usize, img.h as usize], &img.data);
                             let h = ctx.load_texture(format!("content:{s}"), ci, egui::TextureOptions::LINEAR);

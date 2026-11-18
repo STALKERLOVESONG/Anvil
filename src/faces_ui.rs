@@ -116,14 +116,15 @@ impl AnvilApp {
                     changed = true;
                 }
                 if ui.selectable_label(matches!(state, Some(FaceTex { texture: None, .. })), "(no texture)").clicked() {
-                    state = Some(FaceTex { texture: None, params: TexParams::default() });
+                    state = Some(FaceTex { texture: None, params: TexParams::default(), uv: None });
                     changed = true;
                 }
                 for (tid, name) in &textures {
                     let on = matches!(state, Some(FaceTex { texture: Some(x), .. }) if x == *tid);
                     if ui.selectable_label(on, name).clicked() {
                         let params = state.as_ref().map(|s| s.params).unwrap_or_default();
-                        state = Some(FaceTex { texture: Some(*tid), params });
+                        let uv = state.as_ref().and_then(|s| s.uv);
+                        state = Some(FaceTex { texture: Some(*tid), params, uv });
                         changed = true;
                     }
                 }
@@ -132,7 +133,8 @@ impl AnvilApp {
         ui.horizontal(|ui| {
             if ui.add_enabled(self.active_texture.is_some(), egui::Button::new("Apply active texture")).clicked() {
                 let params = state.as_ref().map(|s| s.params).unwrap_or_default();
-                state = Some(FaceTex { texture: self.active_texture, params });
+                let uv = state.as_ref().and_then(|s| s.uv);
+                state = Some(FaceTex { texture: self.active_texture, params, uv });
                 changed = true;
             }
             if ui.button("Use object's texture").clicked() {
@@ -205,8 +207,10 @@ impl AnvilApp {
         let Some(o) = self.map.get_mut(id) else { return };
         match face {
             Some(f) => {
-                let params = o.face_tex.get(f).cloned().flatten().map(|x| x.params).unwrap_or_default();
-                *o.face_tex_mut(f) = Some(FaceTex { texture: Some(tex), params });
+                let old = o.face_tex.get(f).cloned().flatten();
+                let params = old.as_ref().map(|x| x.params).unwrap_or_default();
+                let uv = old.and_then(|x| x.uv);
+                *o.face_tex_mut(f) = Some(FaceTex { texture: Some(tex), params, uv });
                 self.status = format!("Put '{name}' on one face of {}", o.name);
             }
             None => {

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0
+
+- **Import Source maps (.bsp).** Use *File → Import Source map (.bsp)…* for Garry's Mod and
+  Half-Life 2 maps.
+  - Every brush becomes its own editable mesh, with each face's Hammer texture alignment
+    kept exactly.
+  - Displacements come in as terrain meshes.
+  - Static props and `prop_*` entities come in as textured props.
+  - Lights, spawns and brush entities come in too.
+  - Clips, invisible walls and the 3D skybox go into hidden folders.
+  - Textures packed into the map are used.
+  - A report lists anything your mounted content doesn't have, and the whole import is one
+    undo step.
+- **MCP:** a new `import_bsp` tool.
+- **Faces can keep an exact texture alignment** (planar axes). Imported Source faces use it.
+  The UV editor and every export follow it.
+- **Security:** paths read from game files can no longer contain `..` or drive letters. A
+  bad addon or map could otherwise have written files outside Anvil's content folder.
+
 ## 0.2.9
 
 - **Transparent textures work everywhere now.** Before, only decals used a picture's

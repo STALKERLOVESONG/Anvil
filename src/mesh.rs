@@ -501,6 +501,17 @@ pub fn box_uv(p: [Vec3; 3], scale: Vec2, offset: Vec2) -> ([Vec2; 3], Vec3, Vec3
     (uv, u_axis, v_axis)
 }
 
+/// A face's planar mapping: its own axes when it has them (faces imported
+/// from Source maps), otherwise the box mapping. Returns the same as `box_uv`.
+pub fn face_uv(p: [Vec3; 3], axes: Option<&crate::map::UvAxes>, scale: Vec2, offset: Vec2) -> ([Vec2; 3], Vec3, Vec3) {
+    let Some(a) = axes else { return box_uv(p, scale, offset) };
+    let sx = if scale.x.abs() < 1e-4 { 1.0 } else { scale.x };
+    let sy = if scale.y.abs() < 1e-4 { 1.0 } else { scale.y };
+    let uv = p.map(|q| Vec2::new((q.dot(a.u) + offset.x) / sx, (q.dot(a.v) + offset.y) / sy));
+    // box_uv's second axis points the way V decreases (image "up")
+    (uv, a.u.normalize_or_zero(), -a.v.normalize_or_zero())
+}
+
 /// Which box face (0..6 = +X -X +Y -Y +Z -Z) a local-space normal points at.
 pub fn box_face_dir(n: Vec3) -> usize {
     let a = n.abs();
@@ -692,9 +703,9 @@ pub fn world_mesh(obj: &Object, textures: &[TextureDef], cache: &mut ModelCache)
         for (ti, tr) in mesh.tris.iter().enumerate() {
             let lp = [mesh.pos[tr[0] as usize] * sc, mesh.pos[tr[1] as usize] * sc, mesh.pos[tr[2] as usize] * sc];
             let face = tri_face_key(obj, &mesh, ti);
-            let (def, params) = match face.and_then(|f| obj.face_tex.get(f)).and_then(|f| f.as_ref()) {
-                Some(ft) => (find(ft.texture), ft.params),
-                None => (texdef, obj.tex_params),
+            let (def, params, axes) = match face.and_then(|f| obj.face_tex.get(f)).and_then(|f| f.as_ref()) {
+                Some(ft) => (find(ft.texture), ft.params, ft.uv.as_ref()),
+                None => (texdef, obj.tex_params, None),
             };
             let Some(t) = def else {
                 tri_tex.push(NO_TEX);
@@ -717,7 +728,7 @@ pub fn world_mesh(obj: &Object, textures: &[TextureDef], cache: &mut ModelCache)
                 tri_uv.push(uv);
                 tbns.push(Mat3::from_cols(rot * Vec3::X, rot * Vec3::Y, rot * Vec3::Z));
             } else {
-                let (uv, ua, va) = box_uv(lp, t.scale * params.scale, t.offset + params.offset);
+                let (uv, ua, va) = face_uv(lp, axes, t.scale * params.scale, t.offset + params.offset);
                 tri_uv.push(rotate_uv(uv, params.rotation));
                 let n = (lp[1] - lp[0]).cross(lp[2] - lp[0]).normalize_or_zero();
                 tbns.push(Mat3::from_cols(rot * ua, rot * va, rot * n));
