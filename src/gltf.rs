@@ -216,10 +216,16 @@ pub fn load(path: &str) -> Result<TriMesh, String> {
         let pbr = &mat["pbrMetallicRoughness"];
         m.materials.push(g.image_file(pbr["baseColorTexture"]["index"].as_u64(), path, &cache));
         m.material_normals.push(g.image_file(mat["normalTexture"]["index"].as_u64(), path, &cache));
+        m.material_alpha.push(match mat["alphaMode"].as_str() {
+            Some("MASK") => 1,
+            Some("BLEND") => 2,
+            _ => 0,
+        });
     }
     let no_mat = m.materials.len() as u16;
     m.materials.push(String::new());
     m.material_normals.push(String::new());
+    m.material_alpha.push(0);
     // walk the scene
     let scene = g.json["scene"].as_u64().unwrap_or(0) as usize;
     let mut stack: Vec<(usize, Mat4, u32)> = g.json["scenes"][scene]["nodes"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64()).map(|i| (i as usize, Mat4::IDENTITY, 0)).collect()).unwrap_or_default();

@@ -24,6 +24,8 @@ struct Server {
 
 type R = Result<Value, String>;
 
+const ALPHA_NAMES: [&str; 3] = ["solid", "cutout", "see_through"];
+
 fn v3(v: &Value, key: &str) -> Option<Vec3> {
     let a = v.get(key)?.as_array()?;
     (a.len() == 3).then(|| Vec3::new(a[0].as_f64().unwrap_or(0.0) as f32, a[1].as_f64().unwrap_or(0.0) as f32, a[2].as_f64().unwrap_or(0.0) as f32))
@@ -360,10 +362,11 @@ impl Server {
                     None => {
                         let mut t = TextureDef::new(if s(a, "name").is_empty() { files.name.clone() } else { s(a, "name").to_string() }, files.image.clone());
                         t.normal_map = files.normal.clone();
+                        t.alpha = files.alpha;
                         self.map.add_texture(t)
                     }
                 };
-                Ok(json!({ "texture_id": id, "image": files.image, "transparent": files.translucent }))
+                Ok(json!({ "texture_id": id, "image": files.image, "alpha": ALPHA_NAMES[files.alpha.min(2) as usize] }))
             }
             "add_texture_file" => {
                 let p = s(a, "path");
@@ -376,9 +379,17 @@ impl Server {
             "set_texture_scale" => {
                 let id = a.get("texture_id").and_then(|x| x.as_u64()).ok_or("texture_id needed")?;
                 let t = self.map.textures.iter_mut().find(|t| t.id == id).ok_or("no such texture")?;
-                let sc = f(a, "studs_per_tile", 8.0).max(0.01);
-                t.scale = glam::Vec2::new(sc, sc);
-                Ok(json!({ "texture_id": id, "studs_per_tile": sc }))
+                if a.get("studs_per_tile").is_some() {
+                    let sc = f(a, "studs_per_tile", 8.0).max(0.01);
+                    t.scale = glam::Vec2::new(sc, sc);
+                }
+                match s(a, "alpha") {
+                    "solid" => t.alpha = 0,
+                    "cutout" => t.alpha = 1,
+                    "see_through" => t.alpha = 2,
+                    _ => {}
+                }
+                Ok(json!({ "texture_id": id, "studs_per_tile": t.scale.x, "alpha": ALPHA_NAMES[t.alpha.min(2) as usize] }))
             }
             "import_model" => {
                 let rel = s(a, "model").to_string();
@@ -517,7 +528,7 @@ fn tools() -> Value {
         { "name": "delete_objects", "description": "Delete objects by id.", "inputSchema": obj(json!({ "ids": { "type": "array", "items": { "type": "integer" } } }), &["ids"]) },
         { "name": "search_content", "description": "Search the mounted Half-Life / GMod content: kind materials (paths under materials/, no extension) or models (.mdl paths). All query words must appear in the path.", "inputSchema": obj(json!({ "kind": { "type": "string", "enum": ["materials", "models"] }, "query": { "type": "string" }, "limit": { "type": "integer" } }), &["kind", "query"]) },
         { "name": "import_texture", "description": "Import a mounted material (from search_content) into the map's textures (PNG + normal map). Returns texture_id to use on objects.", "inputSchema": obj(json!({ "material": { "type": "string" }, "name": { "type": "string" } }), &["material"]) },
-        { "name": "set_texture_scale", "description": "How many units one tile of a texture covers (default 8).", "inputSchema": obj(json!({ "texture_id": { "type": "integer" }, "studs_per_tile": { "type": "number" } }), &["texture_id", "studs_per_tile"]) },
+        { "name": "set_texture_scale", "description": "A texture's tiling (studs_per_tile: units one tile covers, default 8) and transparency (alpha: solid | cutout | see_through; imported GMod materials get theirs set already).", "inputSchema": obj(json!({ "texture_id": { "type": "integer" }, "studs_per_tile": { "type": "number" }, "alpha": { "type": "string", "enum": ["solid", "cutout", "see_through"] } }), &["texture_id"]) },
         { "name": "add_texture_file", "description": "Add an image file on this PC as a texture.", "inputSchema": obj(json!({ "path": { "type": "string" }, "name": { "type": "string" } }), &["path"]) },
         { "name": "import_model", "description": "Convert a mounted .mdl (from search_content) into a textured OBJ and return its path (and size) for add_objects kind prop.", "inputSchema": obj(json!({ "model": { "type": "string" }, "scale": { "type": "number" } }), &["model"]) },
         { "name": "model_bounds", "description": "A model file's size (at scale 1).", "inputSchema": obj(json!({ "model": { "type": "string" } }), &["model"]) },

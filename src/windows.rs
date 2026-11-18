@@ -159,6 +159,15 @@ impl AnvilApp {
                             }
                             ui.horizontal(|ui| {
                                 changed |= ui.checkbox(&mut t.metallic, "Metallic").changed();
+                                egui::ComboBox::from_id_salt(("tex_alpha", t.id))
+                                    .selected_text(["Solid", "Cut out", "See-through"][t.alpha.min(2) as usize])
+                                    .show_ui(ui, |ui| {
+                                        changed |= ui.selectable_value(&mut t.alpha, 0, "Solid").changed();
+                                        changed |= ui.selectable_value(&mut t.alpha, 1, "Cut out").on_hover_text("The picture's see-through parts are holes (fences, leaves, grates)").changed();
+                                        changed |= ui.selectable_value(&mut t.alpha, 2, "See-through").on_hover_text("Blended by the picture's alpha (glass, smoke)").changed();
+                                    })
+                                    .response
+                                    .on_hover_text("Transparency of this picture");
                                 ui.label("Base material");
                                 changed |= material_combo(ui, ("tex_base", t.id), &mut t.base_material);
                             });

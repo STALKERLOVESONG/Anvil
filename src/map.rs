@@ -176,6 +176,10 @@ pub struct TextureDef {
     pub normal_map: String,
     #[serde(default)]
     pub metallic: bool,
+    /// 0 solid, 1 cut-out (the picture's see-through pixels are holes),
+    /// 2 see-through (blended, like glass).
+    #[serde(default)]
+    pub alpha: u8,
     /// Material the texture sits on (Roblox MaterialVariant base material).
     #[serde(default = "plastic")]
     pub base_material: Material,
@@ -208,6 +212,7 @@ impl TextureDef {
             image,
             normal_map: String::new(),
             metallic: false,
+            alpha: 0,
             base_material: Material::Plastic,
             scale: tile(),
             offset: Vec2::ZERO,

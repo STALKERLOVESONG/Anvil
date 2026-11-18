@@ -27,6 +27,9 @@ pub struct TriMesh {
     pub materials: Vec<String>,
     /// Normal map path per material ("" = none).
     pub material_normals: Vec<String>,
+    /// Transparency per material: 0 solid, 1 cut-out (the picture's
+    /// see-through pixels are holes: fences, leaves), 2 see-through (glass).
+    pub material_alpha: Vec<u8>,
 }
 
 impl TriMesh {
@@ -308,6 +311,13 @@ fn load_obj(path: &str) -> Result<TriMesh, String> {
         for mat in mats {
             m.materials.push(resolve(&mat.diffuse_texture));
             m.material_normals.push(resolve(&mat.normal_texture));
+            let see = mat.dissolve.is_some_and(|d| d < 0.999_9);
+            m.material_alpha.push(match (&mat.dissolve_texture, see) {
+                (Some(_), true) => 2,
+                (Some(_), false) => 1,
+                (None, true) => 2,
+                (None, false) => 0,
+            });
         }
     }
     let has_tex = m.materials.iter().any(|t| !t.is_empty());
@@ -332,6 +342,7 @@ fn load_obj(path: &str) -> Result<TriMesh, String> {
         m.uv.clear();
         m.materials.clear();
         m.material_normals.clear();
+        m.material_alpha.clear();
     }
     Ok(m)
 }
@@ -541,6 +552,8 @@ pub struct SceneTex {
     pub normal: String,
     pub metallic: bool,
     pub tint: [u8; 3],
+    /// 0 solid, 1 cut-out, 2 see-through (`TriMesh::material_alpha`).
+    pub alpha: u8,
 }
 
 /// Marks an untextured triangle in `WorldMesh::tri_tex`.
@@ -659,6 +672,7 @@ pub fn world_mesh(obj: &Object, textures: &[TextureDef], cache: &mut ModelCache)
                 normal: mesh.material_normals.get(i).cloned().unwrap_or_default(),
                 metallic: false,
                 tint: obj.tex_params.tint,
+                alpha: mesh.material_alpha.get(i).copied().unwrap_or(0),
             });
         }
         for t in &mesh.tris {
@@ -692,7 +706,7 @@ pub fn world_mesh(obj: &Object, textures: &[TextureDef], cache: &mut ModelCache)
                 Some(i) => i,
                 None => {
                     slots.push((t.id, params));
-                    texs.push(SceneTex { image: t.image.clone(), normal: t.normal_map.clone(), metallic: t.metallic, tint: params.tint });
+                    texs.push(SceneTex { image: t.image.clone(), normal: t.normal_map.clone(), metallic: t.metallic, tint: params.tint, alpha: t.alpha });
                     any_normal |= !t.normal_map.trim().is_empty();
                     slots.len() - 1
                 }

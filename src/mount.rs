@@ -274,10 +274,12 @@ pub struct MaterialFiles {
     pub image: String,
     pub normal: String,
     pub translucent: bool,
+    /// 0 solid, 1 cut-out ($alphatest), 2 see-through ($translucent).
+    pub alpha: u8,
 }
 
 /// Follows a material (path under `materials/`, no extension) to its VTFs.
-fn resolve_material(m: &Mounts, mat: &str) -> Option<(String, Option<String>, bool)> {
+fn resolve_material(m: &Mounts, mat: &str) -> Option<(String, Option<String>, u8)> {
     let mat = norm(mat);
     let mut params = std::collections::HashMap::new();
     let mut shader = String::new();
@@ -303,8 +305,15 @@ fn resolve_material(m: &Mounts, mat: &str) -> Option<(String, Option<String>, bo
     let base_vtf = format!("materials/{}.vtf", norm(&base));
     m.read(&base_vtf)?;
     let bump = params.get("$bumpmap").or_else(|| params.get("$normalmap")).map(|b| format!("materials/{}.vtf", norm(b)));
-    let translucent = params.contains_key("$translucent") || params.contains_key("$alphatest") || shader.contains("decal");
-    Some((base_vtf, bump, translucent))
+    let on = |k: &str| params.get(k).is_some_and(|v| v.trim() != "0");
+    let alpha = if on("$alphatest") {
+        1
+    } else if on("$translucent") || shader.contains("decal") {
+        2
+    } else {
+        0
+    };
+    Some((base_vtf, bump, alpha))
 }
 
 fn save_vtf_png(m: &Mounts, vtf_rel: &str, out: &Path) -> Result<(), String> {
@@ -331,7 +340,8 @@ pub fn preview_material(m: &Mounts, mat: &str, max_dim: u32) -> Result<source::R
 /// Converts a material into PNG files under `content/materials/`.
 pub fn import_material(m: &Mounts, mat: &str) -> Result<MaterialFiles, String> {
     let mat = norm(mat);
-    let (base, bump, translucent) = resolve_material(m, &mat).ok_or_else(|| format!("{mat}: no base texture found"))?;
+    let (base, bump, alpha) = resolve_material(m, &mat).ok_or_else(|| format!("{mat}: no base texture found"))?;
+    let translucent = alpha > 0;
     let dir = content_dir();
     let image = dir.join(format!("{}.png", base.trim_end_matches(".vtf")));
     save_vtf_png(m, &base, &image)?;
@@ -343,7 +353,7 @@ pub fn import_material(m: &Mounts, mat: &str) -> Result<MaterialFiles, String> {
         }
     }
     let name = mat.rsplit('/').next().unwrap_or(&mat).to_string();
-    Ok(MaterialFiles { name, image: image.to_string_lossy().to_string(), normal, translucent })
+    Ok(MaterialFiles { name, image: image.to_string_lossy().to_string(), normal, translucent, alpha })
 }
 
 /// Converts a model (and its textures) into an OBJ + MTL + PNGs under
@@ -365,6 +375,16 @@ pub fn import_model(m: &Mounts, mdl: &str, scale: f32) -> Result<PathBuf, String
         if let Ok(files) = import_material(m, mat) {
             if let Some(rel) = pathdiff(Path::new(&files.image), &obj_dir) {
                 let _ = writeln!(mtl, "map_Kd {rel}");
+                // the picture's alpha: holes (cut-out) or see-through
+                match files.alpha {
+                    1 => {
+                        let _ = writeln!(mtl, "map_d {rel}");
+                    }
+                    2 => {
+                        let _ = writeln!(mtl, "map_d {rel}\nd 0.999");
+                    }
+                    _ => {}
+                }
             }
             if !files.normal.is_empty() {
                 if let Some(rel) = pathdiff(Path::new(&files.normal), &obj_dir) {

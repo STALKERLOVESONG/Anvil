@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.9
+
+- **Transparent textures work everywhere now.** Before, only decals used a picture's
+  transparency; fences, leaves, grates and glass on props drew solid.
+  - **Cut out:** the picture's see-through pixels are holes. Use it for chain-link, foliage
+    and lattice.
+  - **See-through:** blended, like glass.
+  - Each texture in the Textures window has a *Transparency* setting.
+  - Half-Life / GMod materials bring their own (`$alphatest` / `$translucent`).
+  - OBJ models use `map_d` and glTF models use `alphaMode`.
+  - Props imported before this update: import them once more to pick up their
+    transparency.
+- **MCP:** `set_texture_scale` also sets a texture's transparency, and `import_texture`
+  reports it.
+
 ## 0.2.8
 
 - **MCP server (`anvil.exe --mcp`)** so an AI assistant can build maps.

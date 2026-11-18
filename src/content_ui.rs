@@ -79,6 +79,7 @@ impl AnvilApp {
                     None => {
                         let mut t = TextureDef::new(f.name.clone(), f.image.clone());
                         t.normal_map = f.normal.clone();
+                        t.alpha = f.alpha;
                         self.map.add_texture(t)
                     }
                 };

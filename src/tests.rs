@@ -3972,3 +3972,38 @@ fn mcp_roofs_face_outward() {
         assert!((top - if kind == "flat" { 10.5 } else { 15.0 }).abs() < 1e-4, "{kind} top {top}");
     }
 }
+
+/// A model whose picture has see-through parts: with map_d (cut-out) the
+/// wall behind shows through the holes; without, the panel is solid.
+#[test]
+fn cut_out_and_see_through_textures() {
+    use crate::view3d::{Camera, RenderOpts, Renderer};
+    let dir = out_dir("alpha");
+    // left half solid white, right half fully transparent
+    image::RgbaImage::from_fn(16, 16, |x, _| if x < 8 { image::Rgba([255, 255, 255, 255]) } else { image::Rgba([255, 255, 255, 0]) }).save(dir.join("half.png")).unwrap();
+    let quad = "mtllib m.mtl\nv -2 0 0\nv 2 0 0\nv 2 4 0\nv -2 4 0\nvt 0 1\nvt 1 1\nvt 1 0\nvt 0 0\nusemtl a\nf 1/1 2/2 3/3\nf 1/1 3/3 4/4\nf 1/1 4/4 3/3\nf 1/1 3/3 2/2\n";
+    let shot = |mtl: &str| {
+        std::fs::write(dir.join("m.mtl"), mtl).unwrap();
+        std::fs::write(dir.join("panel.obj"), quad).unwrap();
+        let mut map = Map::default();
+        map.add(Object::brush(Shape::Box, Vec3::new(20.0, 10.0, 1.0), Vec3::new(0.0, 2.0, -5.0), [220, 30, 30], Material::Plastic));
+        map.add(Object::new(Kind::Prop { model: dir.join("panel.obj").to_string_lossy().to_string(), scale: Vec3::ONE, roblox_mesh_id: String::new() }, Vec3::ZERO, [255; 3], Material::Plastic));
+        let scene = crate::mesh::build_scene(&map, &mut ModelCache::default());
+        let ctx = eframe::egui::Context::default();
+        let rect = eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::vec2(200.0, 200.0));
+        let cam = Camera::looking_at(Vec3::new(0.0, 2.0, 6.0), Vec3::new(0.0, 2.0, 0.0));
+        let opts = RenderOpts { fov: 60.0, grid: 1.0, plane_y: 0.0, show_grid: false, outlines: false, bg: [0, 0, 0], scale: 1.0, filter: false, lighting: Default::default() };
+        let mut r = Renderer::default();
+        r.render(&ctx, rect, &cam, &opts, &scene, &[], &HashMap::new(), &mut crate::texture::TexCache::default());
+        let (w, _, px) = r.pixels();
+        let at = |x: usize, y: usize| [px[(y * w + x) * 4], px[(y * w + x) * 4 + 1], px[(y * w + x) * 4 + 2]];
+        (at(60, 100), at(140, 100)) // the panel's left (solid) and right (transparent) halves
+    };
+    let red = |c: [u8; 3]| c[0] > 100 && c[1] < 60;
+    let (l, r) = shot("newmtl a\nmap_Kd half.png\n");
+    assert!(!red(l) && !red(r), "no map_d: the whole panel is solid ({l:?} {r:?})");
+    let (l, r) = shot("newmtl a\nmap_Kd half.png\nmap_d half.png\n");
+    assert!(!red(l) && red(r), "cut-out: the wall shows through the transparent half ({l:?} {r:?})");
+    let (l, r) = shot("newmtl a\nmap_Kd half.png\nmap_d half.png\nd 0.999\n");
+    assert!(!red(l) && red(r), "see-through: the same, blended ({l:?} {r:?})");
+}

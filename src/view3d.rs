@@ -265,6 +265,8 @@ struct Paint {
     nrm: Option<Arc<TexImage>>,
     metallic: bool,
     decal: bool,
+    /// 0 solid, 1 cut-out, 2 see-through (`SceneTex::alpha`).
+    mode: u8,
 }
 
 enum Shade {
@@ -412,8 +414,10 @@ impl Band<'_> {
                         // bilinear only matters when magnified; mips already smooth the rest
                         let s = paint.tex.sample_lod(uv.x, uv.y, lod, self.bilinear && lod < 1.0);
                         let mut alpha = paint.alpha;
-                        if paint.decal {
+                        if paint.decal || paint.mode == 2 {
                             alpha *= s[3] as f32 / 255.0;
+                        } else if paint.mode == 1 && s[3] < 128 {
+                            continue; // a hole in a cut-out picture (fence, leaves)
                         }
                         if alpha < 0.02 {
                             continue;
@@ -851,6 +855,7 @@ fn build_frame(
                             nrm: if wm.tri_tbn.len() == wm.mesh.tris.len() { textures.get(&t.normal) } else { None },
                             metallic: t.metallic,
                             decal: wm.decal,
+                            mode: t.alpha,
                         })
                     })
                 })
@@ -984,7 +989,8 @@ fn build_frame(
                     m
                 };
                 let rt = RTri { p: [pp[0], pp[q], pp[q + 1]], w: [ww[0], ww[q], ww[q + 1]], uvw: [uvw[0], uvw[q], uvw[q + 1]], shade, grad, tsize, n, metallic, lmask };
-                if deferred_obj {
+                let see_through = matches!(&rt.shade, Shade::Tex { paint, .. } if paint.mode == 2);
+                if deferred_obj || see_through {
                     part.deferred.push((depth, rt));
                 } else {
                     part.opaque.push(rt);
