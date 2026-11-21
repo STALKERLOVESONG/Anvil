@@ -106,6 +106,30 @@ impl AnvilApp {
             });
             ui.end_row();
         });
+        if self.tool == Tool::Wall {
+            let s = &mut self.settings;
+            ch |= ui.checkbox(&mut s.wall_trim, "Add trim to new walls").on_hover_text("Baseboard and/or crown strips on both sides of each wall you draw. Corners where walls meet join up.").changed();
+            if s.wall_trim {
+                egui::Grid::new("tp_wall_trim").num_columns(2).spacing([6.0, 3.0]).show(ui, |ui| {
+                    ui.label("Trim");
+                    ui.horizontal(|ui| {
+                        ch |= ui.checkbox(&mut s.wall_trim_baseboard, "Baseboard").on_hover_text("Along the bottom of the wall").changed();
+                        ch |= ui.checkbox(&mut s.wall_trim_crown, "Crown").on_hover_text("Along the top of the wall").changed();
+                    });
+                    ui.end_row();
+                    ui.label("Trim size");
+                    ui.horizontal(|ui| {
+                        ch |= ui.add(egui::DragValue::new(&mut s.trim_height).speed(0.05).range(0.05..=50.0).prefix("h ")).changed();
+                        ch |= ui.add(egui::DragValue::new(&mut s.trim_depth).speed(0.02).range(0.02..=10.0).prefix("d ")).changed();
+                        ch |= ui.color_edit_button_srgb(&mut s.trim_color).changed();
+                    });
+                    ui.end_row();
+                });
+                if !s.wall_trim_baseboard && !s.wall_trim_crown {
+                    ui.label(RichText::new("Pick Baseboard and/or Crown").small().weak());
+                }
+            }
+        }
         if self.tool == Tool::Layout {
             let s = &mut self.settings;
             egui::Grid::new("tp_build2").num_columns(2).spacing([6.0, 3.0]).show(ui, |ui| {

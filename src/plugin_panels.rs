@@ -44,6 +44,14 @@ fn fetch(url: String, hosts: Vec<String>) -> Receiver<Option<egui::ColorImage>> 
     rx
 }
 
+/// A model parsed in the background (see `warm_model`).
+pub(crate) struct Warmed {
+    path: String,
+    mesh: Result<crate::mesh::TriMesh, String>,
+    textures: Vec<(String, Option<std::sync::Arc<crate::texture::TexImage>>)>,
+    max_dim: u32,
+}
+
 impl AnvilApp {
     fn panel_image(&mut self, ctx: &egui::Context, url: &str, hosts: &[String]) -> Option<egui::TextureId> {
         let st = self.panel_state.images.entry(url.to_string()).or_insert_with(|| WebImage::Loading(fetch(url.to_string(), hosts.to_vec())));
@@ -125,6 +133,47 @@ impl AnvilApp {
         }
     }
 
+    /// A model a plugin just downloaded: parse it and decode its textures on
+    /// a background thread, so placing it doesn't freeze the editor.
+    pub(crate) fn warm_model(&mut self, path: &str) {
+        self.models.set_pending(path);
+        let (p, tx, max_dim) = (path.to_string(), self.warm_tx.clone(), self.textures.max_dim());
+        std::thread::spawn(move || {
+            let m = crate::mesh::load_model(&p);
+            let mut texs = Vec::new();
+            if let Ok(m) = &m {
+                for img in m.materials.iter().chain(&m.material_normals).filter(|s| !s.is_empty()) {
+                    if !texs.iter().any(|(q, _): &(String, _)| q == img) {
+                        texs.push((img.clone(), crate::texture::load(img, max_dim)));
+                    }
+                }
+            }
+            let _ = tx.send(Warmed { path: p, mesh: m, textures: texs, max_dim });
+        });
+    }
+
+    pub(crate) fn poll_warmed(&mut self, ctx: &egui::Context) {
+        let mut any = false;
+        while let Ok(w) = self.warm_rx.try_recv() {
+            any = true;
+            for (img, t) in w.textures {
+                self.textures.put(&img, t, w.max_dim);
+            }
+            match w.mesh {
+                Ok(m) => self.models.insert(&w.path, m),
+                Err(e) => {
+                    self.status = format!("Couldn't open {}: {e}", w.path);
+                    self.models.set_failed(&w.path, e);
+                }
+            }
+            self.forget_thumb(&w.path);
+        }
+        if any {
+            self.scene_cache.clear();
+            ctx.request_repaint();
+        }
+    }
+
     fn apply_plugin_imports(&mut self, out: &Outcome) {
         for (path, name) in &out.imports {
             if !self.settings.model_library.iter().any(|e| e.path == *path) {
@@ -132,6 +181,7 @@ impl AnvilApp {
             }
             self.models.forget(path);
             self.forget_thumb(path);
+            self.warm_model(path);
             self.active_model = Some(path.clone());
             self.tool = crate::app::Tool::Prop;
             self.status = format!("Added {} to the model library. Click in a view to place it.", if name.is_empty() { path } else { name });

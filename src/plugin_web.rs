@@ -75,8 +75,16 @@ fn request(url: &str, headers: &[(String, String)], hosts: &[String], download: 
     if !url_allowed(url, hosts) {
         return Err(format!("Not allowed: {url} isn't https to one of this plugin's hosts"));
     }
+    // shared agents keep connections open, so a second request to the same
+    // site skips the connection + TLS handshake
+    static API: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    static DOWNLOADS: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     let s = std::time::Duration::from_secs;
-    let agent = if download { ureq::AgentBuilder::new().timeout_connect(s(20)).timeout_read(s(60)).build() } else { ureq::AgentBuilder::new().timeout(s(30)).build() };
+    let agent = if download {
+        DOWNLOADS.get_or_init(|| ureq::AgentBuilder::new().timeout_connect(s(20)).timeout_read(s(60)).max_idle_connections_per_host(4).build())
+    } else {
+        API.get_or_init(|| ureq::AgentBuilder::new().timeout(s(30)).max_idle_connections_per_host(4).build())
+    };
     let mut r = agent.get(url).set("User-Agent", "Anvil-plugin");
     for (k, v) in headers {
         r = r.set(k, v);
@@ -107,6 +115,22 @@ struct Job {
     path: String,
     got: u64,
     total: u64,
+    cancel: bool,
+}
+
+fn cancelled(id: i64) -> bool {
+    JOBS.lock().ok().and_then(|j| j.as_ref().and_then(|m| m.get(&id).map(|x| x.cancel))).unwrap_or(false)
+}
+
+/// Asks a download / unzip job to stop (its partial file is removed).
+pub fn cancel_job(id: i64) {
+    set_job(id, |j| j.cancel = true);
+}
+
+/// Worth trying a download again? (dropped connections, timeouts, busy servers)
+pub fn transient(e: &str) -> bool {
+    let e = e.to_ascii_lowercase();
+    ["timed out", "connection", "reset", "broken pipe", "download stopped", "status code 500", "status code 502", "status code 503", "status code 504", "status code 429"].iter().any(|k| e.contains(k))
 }
 
 static JOBS: Mutex<Option<HashMap<i64, Job>>> = Mutex::new(None);
@@ -153,12 +177,37 @@ pub fn start_download(url: String, name: &str, headers: Vec<(String, String)>, h
                     return std::fs::write(&path, r?).map_err(|e| e.to_string());
                 }
             }
-            let resp = request(&url, &headers, &hosts, true)?;
-            let total = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-            set_job(id, |j| j.total = total);
-            // a compressed body's length isn't the length that comes out
-            let plain = resp.header("Content-Encoding").is_none_or(|e| e.eq_ignore_ascii_case("identity"));
-            save_body(resp.into_reader(), if plain { total } else { 0 }, &path, &|got| set_job(id, |j| j.got = got))
+            // a dropped connection or a busy server gets two more tries
+            // (after 2 s, then 5 s); a cancelled job stops right away
+            let mut last = String::new();
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(if attempt == 1 { 2 } else { 5 }));
+                }
+                if cancelled(id) {
+                    return Err("cancelled".into());
+                }
+                let r = (|| -> Result<(), String> {
+                    let resp = request(&url, &headers, &hosts, true)?;
+                    let total = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                    set_job(id, |j| {
+                        j.total = total;
+                        j.got = 0;
+                    });
+                    // a compressed body's length isn't the length that comes out
+                    let plain = resp.header("Content-Encoding").is_none_or(|e| e.eq_ignore_ascii_case("identity"));
+                    save_body_ctl(resp.into_reader(), if plain { total } else { 0 }, &path, &|got| {
+                        set_job(id, |j| j.got = got);
+                        !cancelled(id)
+                    })
+                })();
+                match r {
+                    Ok(()) => return Ok(()),
+                    Err(e) if transient(&e) && !cancelled(id) => last = e,
+                    Err(e) => return Err(if cancelled(id) { "cancelled".into() } else { e }),
+                }
+            }
+            Err(last)
         })();
         set_job(id, |j| {
             j.state = match r {
@@ -173,7 +222,16 @@ pub fn start_download(url: String, name: &str, headers: Vec<(String, String)>, h
 /// Writes a download to `path` through a `.part` file, so a download that
 /// stops halfway (connection dropped, Anvil closed) never looks finished.
 /// `total` (Content-Length, 0 = unknown) must match what arrived.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn save_body(rd: impl Read, total: u64, path: &Path, progress: &dyn Fn(u64)) -> Result<(), String> {
+    save_body_ctl(rd, total, path, &|g| {
+        progress(g);
+        true
+    })
+}
+
+/// `save_body` whose progress callback can stop it (return false).
+pub fn save_body_ctl(rd: impl Read, total: u64, path: &Path, progress: &dyn Fn(u64) -> bool) -> Result<(), String> {
     let part = path.with_extension(format!("{}.part", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
     let r = (|| -> Result<(), String> {
         let mut rd = rd.take(MAX_DOWNLOAD + 1);
@@ -194,7 +252,9 @@ pub fn save_body(rd: impl Read, total: u64, path: &Path, progress: &dyn Fn(u64))
                 return Err("download is over 1 GB".into());
             }
             std::io::Write::write_all(&mut f, &buf[..n]).map_err(|e| e.to_string())?;
-            progress(got);
+            if !progress(got) {
+                return Err("cancelled".into());
+            }
         }
         if total > 0 && got != total {
             return Err(format!("download was cut off ({} of {} MB), try again", got / 1_000_000, total.div_ceil(1_000_000)));
@@ -256,6 +316,24 @@ pub fn unzip_in(zip: &Path, root: &Path) -> Result<String, String> {
         std::fs::write(&dest, buf).map_err(|e| e.to_string())?;
     }
     Ok(out.to_string_lossy().to_string())
+}
+
+/// `unzip_in` on a background thread, as a job: its file is the folder the
+/// zip was unpacked into.
+pub fn start_unzip(zip: PathBuf, root: PathBuf) -> i64 {
+    let id = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
+    set_job(id, |j| j.state = "running".into());
+    std::thread::spawn(move || {
+        let r = unzip_in(&zip, &root);
+        set_job(id, |j| match r {
+            Ok(dir) => {
+                j.path = dir;
+                j.state = "done".into();
+            }
+            Err(e) => j.state = format!("error: {e}"),
+        });
+    });
+    id
 }
 
 /// Files ending in `.ext` under `dir` (inside the plugin's folder).

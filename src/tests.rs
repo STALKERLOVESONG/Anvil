@@ -1090,7 +1090,7 @@ mod faces_and_views {
 
     #[test]
     fn renders_top_view_with_face_textures() {
-        let dir = out_dir("faces");
+        let dir = out_dir("faces_export");
         let (mut map, a, b) = textures(&dir);
         map.add(Object::brush(Shape::Box, Vec3::new(40.0, 1.0, 30.0), Vec3::new(0.0, -0.5, 0.0), [110, 112, 118], Material::Slate));
         let walls = crate::building::house_walls(&[Vec3::new(-10.0, 0.0, -8.0), Vec3::new(10.0, 0.0, -8.0), Vec3::new(10.0, 0.0, 8.0), Vec3::new(-10.0, 0.0, 8.0)], 1.0, 8.0, 0.0, [255, 255, 255], Material::Brick);
@@ -1718,7 +1718,7 @@ mod team_create {
         let mut h = P::new(hs, hm);
         let mut g = P::new(Session::join(&addr, "WRONG123", "G", [2, 2, 2], d.join("g")).unwrap(), Map::default());
         wait(&mut [&mut h, &mut g], "refusal", |p| p[1].s.ended.is_some());
-        assert!(g.s.ended.as_ref().unwrap().contains("Wrong invite code"), "{:?}", g.s.ended);
+        assert!(g.s.ended.as_ref().unwrap().contains("Wrong room code"), "{:?}", g.s.ended);
         assert!(h.s.pending.is_empty());
 
         // an older Anvil gets a clear version message
@@ -1900,6 +1900,146 @@ mod team_create {
         assert!(validate_object(&o).is_ok());
         o.pos.x = f32::NAN;
         assert!(validate_object(&o).is_err());
+    }
+
+    /// Joining with just the room code: the host is found on the network,
+    /// a wrong code finds nothing, and the found address really is the room.
+    #[test]
+    fn room_code_finds_the_room() {
+        use crate::room;
+        let d = dir("room_code");
+        let (mut hm, _, _) = host_map(&d);
+        let hs = Session::host(&mut hm, "H", [1, 1, 1], 0, false, d.join("host_cache")).unwrap();
+        // the session's own beacon may share ports with other tests: use a private one
+        let beacon = room::Beacon::start(&hs.code, hs.port, &[0], false).unwrap();
+        let here = [std::net::Ipv4Addr::LOCALHOST];
+        let code = hs.code.clone();
+        let pretty = format!("{}-{}", &code[..4], &code[4..]).to_lowercase();
+        let found = room::find(&pretty, &here, &[beacon.port], Duration::from_secs(3)).unwrap();
+        assert_eq!(found.port(), hs.port);
+
+        // a different (valid-looking) code: nobody answers
+        let other = if code.starts_with('A') { format!("B{}", &code[1..]) } else { format!("A{}", &code[1..]) };
+        let t = Instant::now();
+        let e = room::find(&other, &here, &[beacon.port], Duration::from_millis(900)).unwrap_err();
+        assert!(e.contains("No room") && t.elapsed() >= Duration::from_millis(800), "{e}");
+        // not a code at all
+        assert!(room::find("hello", &here, &[beacon.port], Duration::from_millis(100)).unwrap_err().contains("isn't a room code"));
+        assert_eq!(room::normalize("abcd ef23"), Some("ABCDEF23".into()));
+        assert_eq!(room::normalize("ABCD-EF2O"), None, "O isn't in codes (looks like 0)");
+
+        // join through what the search found
+        let mut h = P::new(hs, hm);
+        let mut g = P::new(Session::join(&found.to_string(), &code, "G", [2, 2, 2], d.join("guest_cache")).unwrap(), Map::default());
+        wait(&mut [&mut h, &mut g], "join request", |p| p[0].s.pending.len() == 1);
+        let c = h.s.pending[0].conn;
+        h.s.approve(c, &h.m);
+        wait(&mut [&mut h, &mut g], "welcome", |p| p[1].s.welcomed);
+
+        // when the room closes, its code stops answering
+        drop(beacon);
+        h.s.leave("done");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(room::find(&code, &here, &[found.port()], Duration::from_millis(600)).is_err());
+    }
+
+    /// A raw answer that wasn't made with the room code is ignored.
+    #[test]
+    fn room_code_answers_must_prove_the_code() {
+        use crate::room;
+        let fake = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = fake.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            for _ in 0..20 {
+                if let Ok((n, from)) = fake.recv_from(&mut buf) {
+                    let q = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let nonce = q.split(' ').nth(2).unwrap_or("").to_string();
+                    let _ = fake.send_to(format!("ANVILROOM2 HERE {nonce} 4444 0123456789abcdef").as_bytes(), from);
+                }
+            }
+        });
+        let r = room::find("ABCD-EF23", &[std::net::Ipv4Addr::LOCALHOST], &[port], Duration::from_millis(900));
+        assert!(r.is_err(), "a forged answer must not be trusted: {r:?}");
+    }
+
+    /// A guest whose window is busy (a file dialog open) sends nothing for a
+    /// while: the keep-alive pings keep them in the room.
+    #[test]
+    fn quiet_guest_stays_in_the_room() {
+        let d = dir("quiet");
+        let (mut hm, _, _) = host_map(&d);
+        let hs = Session::host(&mut hm, "H", [1, 1, 1], 0, false, d.join("host_cache")).unwrap();
+        let addr = format!("127.0.0.1:{}", hs.port);
+        let code = hs.code.clone();
+        let mut h = P::new(hs, hm);
+        let mut g = P::new(Session::join(&addr, &code, "G", [2, 2, 2], d.join("guest_cache")).unwrap(), Map::default());
+        wait(&mut [&mut h, &mut g], "join request", |p| p[0].s.pending.len() == 1);
+        let c = h.s.pending[0].conn;
+        h.s.approve(c, &h.m);
+        wait(&mut [&mut h, &mut g], "welcome", |p| p[1].s.welcomed);
+        // the guest's app freezes for longer than the host's quiet limit (2 s in tests)
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(4) {
+            let r = h.s.pump(&mut h.m, &h.pr);
+            h.got.push(r);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(h.s.peers.len(), 1, "guest still in the room: {:?}", h.s.log);
+        let r = g.s.pump(&mut g.m, &g.pr);
+        g.got.push(r);
+        assert!(g.s.ended.is_none(), "{:?}", g.s.ended);
+        // and edits still flow both ways
+        let id = h.m.objects[0].id;
+        h.m.get_mut(id).unwrap().pos.y = 9.0;
+        wait(&mut [&mut h, &mut g], "edit after the freeze", |p| p[1].m.get(id).is_some_and(|o| o.pos.y == 9.0));
+    }
+
+    /// A guest imports a Source map in the middle of a session: nobody gets
+    /// dropped, and the host (and other guests) get every object, folder and
+    /// texture, with each face's texture alignment intact.
+    #[test]
+    fn guest_imports_a_bsp_without_leaving() {
+        let d = dir("bsp_guest");
+        let (mut hm, _, _) = host_map(&d);
+        let hs = Session::host(&mut hm, "H", [1, 1, 1], 0, false, d.join("host_cache")).unwrap();
+        let addr = format!("127.0.0.1:{}", hs.port);
+        let code = hs.code.clone();
+        let mut h = P::new(hs, hm);
+        let mut g = P::new(Session::join(&addr, &code, "G", [2, 2, 2], d.join("guest_cache")).unwrap(), Map::default());
+        let mut g2 = P::new(Session::join(&addr, &code, "G2", [3, 3, 3], d.join("g2_cache")).unwrap(), Map::default());
+        wait(&mut [&mut h, &mut g, &mut g2], "join requests", |p| p[0].s.pending.len() == 2);
+        for c in h.s.pending.iter().map(|p| p.conn).collect::<Vec<_>>() {
+            h.s.approve(c, &h.m);
+        }
+        wait(&mut [&mut h, &mut g, &mut g2], "welcome", |p| p[1].s.welcomed && p[2].s.welcomed);
+
+        // the guest imports (the same steps File > Import Source map does)
+        let bsp = crate::bsp::Bsp::parse(&super::bsp_import::synthetic_bsp()).unwrap();
+        let content = crate::mount::Layered { files: &bsp.pak, dirs: Vec::new(), base: None };
+        let opts = crate::bsp::Options { scale: 0.07, spawn_size: Vec3::new(6.0, 0.2, 6.0), props: true };
+        let imp = crate::bsp::import_parsed(&bsp, "synthetic", &content, &opts, &|_| {}).unwrap();
+        let ids = crate::bsp::apply(&mut g.m, imp);
+        let want = g.m.objects.len();
+        wait(&mut [&mut h, &mut g, &mut g2], "import reaches everyone", |p| p[0].m.objects.len() == want && p[2].m.objects.len() == want);
+        assert!(g.s.ended.is_none() && g2.s.ended.is_none() && h.s.peers.len() == 2, "everyone still connected: {:?} {:?}", g.s.ended, h.s.log);
+        for id in &ids {
+            let a = g.m.get(*id).unwrap();
+            assert_eq!(Some(a), h.m.get(*id), "host has object {id} exactly");
+            assert_eq!(Some(a), g2.m.get(*id), "other guest has object {id} exactly");
+        }
+        assert_eq!(h.m.folders.len(), g.m.folders.len());
+        assert!(h.m.folders.iter().any(|f| f.name == "synthetic"));
+        assert_eq!(h.m.textures.len(), g.m.textures.len());
+        // the texture picture itself arrives too
+        let tex = g.m.textures.iter().find(|t| t.name == "checker").unwrap().image.clone();
+        wait(&mut [&mut h, &mut g, &mut g2], "texture file", |p| p[2].got.iter().any(|r| r.assets.iter().any(|a| a.0 == tex)));
+
+        // the host edits an imported brush; the importing guest sees it
+        let id = ids[0];
+        h.m.get_mut(id).unwrap().pos.x += 5.0;
+        let x = h.m.get(id).unwrap().pos.x;
+        wait(&mut [&mut h, &mut g, &mut g2], "edit of imported brush", |p| (p[1].m.get(id).unwrap().pos.x - x).abs() < 1e-4);
     }
 }
 
@@ -2877,6 +3017,134 @@ mod plugin_web_api {
         let imgs = w.iter().filter(|x| matches!(x, Widget::Row(items) if items.iter().any(|i| matches!(i, Widget::Image { url, .. } if url.starts_with("https://media.sketchfab.com"))))).count();
         println!("LIVE results {rows}, with thumbnails {imgs}; log {:?}", host.log.iter().rev().take(3).collect::<Vec<_>>());
         assert!(rows > 0);
+    }
+
+    /// Sketchfab offers both a .glb and a zipped .gltf of each model; the
+    /// plugin downloads whichever is smaller, and remembers which kind of
+    /// token works so later downloads need one API call.
+    #[test]
+    fn sketchfab_takes_the_smaller_download() {
+        let _turn = SKETCHFAB.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::map::{Map, Material, Object, Shape};
+        use std::io::Write;
+        let (mut host, idx) = sketchfab_host();
+        let (map, models) = (Map::default(), crate::mesh::ModelCache::default());
+        host.panel_event(idx, &map, &models, 1.0, "token_in", "tok-small");
+        host.panel_event(idx, &map, &models, 1.0, "save_token", "");
+        // the zip is the small one here
+        let tri: Vec<u8> = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let gltf = serde_json::json!({
+            "asset": { "version": "2.0" }, "scene": 0, "scenes": [{ "nodes": [0] }], "nodes": [{ "mesh": 0 }],
+            "meshes": [{ "primitives": [{ "attributes": { "POSITION": 0 } }] }],
+            "accessors": [{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0] }],
+            "bufferViews": [{ "buffer": 0, "byteLength": 36 }], "buffers": [{ "uri": "scene.bin", "byteLength": 36 }]
+        });
+        let mut zip = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut zip);
+            z.start_file("scene.gltf", zip::write::SimpleFileOptions::default()).unwrap();
+            z.write_all(gltf.to_string().as_bytes()).unwrap();
+            z.start_file("scene.bin", zip::write::SimpleFileOptions::default()).unwrap();
+            z.write_all(&tri).unwrap();
+            z.finish().unwrap();
+        }
+        let mut cube = Map::default();
+        cube.add(Object::brush(Shape::Box, glam::Vec3::ONE, glam::Vec3::ZERO, [200; 3], Material::Wood));
+        let glb = crate::blender_export::scene_glb(&cube, &mut crate::mesh::ModelCache::default(), 1.0);
+        let s3 = "https://sketchfab-prod-media.s3.amazonaws.com/archives";
+        mock(
+            "https://api.sketchfab.com/v3/models/sss1/download",
+            serde_json::json!({ "glb": { "url": format!("{s3}/sss1/m.glb"), "size": 50_000_000 }, "gltf": { "url": format!("{s3}/sss1/m.zip"), "size": 2_000 } }).to_string().as_bytes(),
+        );
+        mock(&format!("{s3}/sss1/m.glb"), &glb);
+        mock(&format!("{s3}/sss1/m.zip"), zip.get_ref());
+        host.panel_event(idx, &map, &models, 1.0, "dl:sss1", "");
+        let mut imports = Vec::new();
+        let t = std::time::Instant::now();
+        while imports.is_empty() && t.elapsed() < std::time::Duration::from_secs(10) {
+            imports.extend(host.panel(idx, &map, &models, 1.0).1.imports);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(imports.len(), 1, "log {:?}", host.log);
+        assert!(imports[0].0.ends_with("scene.gltf"), "took the 2 KB zip, not the 50 MB glb: {}", imports[0].0);
+        host.panel_event(idx, &map, &models, 1.0, "forget_token", "");
+    }
+
+    /// A cancelled download stops and leaves no file (complete or partial).
+    #[test]
+    fn cancelled_downloads_leave_nothing() {
+        let d = super::out_dir("cancel_dl");
+        let p = d.join("big.glb");
+        let _ = std::fs::remove_file(&p);
+        let data = vec![7u8; 2_000_000];
+        let r = save_body_ctl(&data[..], 2_000_000, &p, &|got| got < 600_000);
+        assert_eq!(r.unwrap_err(), "cancelled");
+        assert!(!p.exists());
+        assert!(std::fs::read_dir(&d).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".part")), "no partial file left");
+        // and one that isn't stopped completes
+        save_body_ctl(&data[..], 2_000_000, &p, &|_| true).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 2_000_000);
+    }
+
+    /// glTF models from Sketchfab often use the specular/glossiness material
+    /// kind, or plain colors without pictures: both must show, not white.
+    #[test]
+    fn gltf_spec_gloss_and_color_materials() {
+        let d = super::out_dir("specgloss");
+        let png = {
+            let mut c = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 100, 50, 255])).write_to(&mut c, image::ImageFormat::Png).unwrap();
+            c.into_inner()
+        };
+        std::fs::write(d.join("leaf.png"), &png).unwrap();
+        let tri: Vec<u8> = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        std::fs::write(d.join("m.bin"), &tri).unwrap();
+        let gltf = serde_json::json!({
+            "asset": { "version": "2.0" }, "scene": 0, "scenes": [{ "nodes": [0] }], "nodes": [{ "mesh": 0 }],
+            "extensionsUsed": ["KHR_materials_pbrSpecularGlossiness"],
+            "images": [{ "uri": "leaf.png" }], "textures": [{ "source": 0 }],
+            "materials": [
+                { "name": "leaves", "alphaMode": "MASK", "extensions": { "KHR_materials_pbrSpecularGlossiness": { "diffuseTexture": { "index": 0 } } } },
+                { "name": "red paint", "extensions": { "KHR_materials_pbrSpecularGlossiness": { "diffuseFactor": [1.0, 0.0, 0.0, 1.0] } } },
+                { "name": "blue metal", "pbrMetallicRoughness": { "baseColorFactor": [0.0, 0.0, 0.214, 1.0] } },
+                { "name": "tinted", "pbrMetallicRoughness": { "baseColorTexture": { "index": 0 }, "baseColorFactor": [0.5, 0.5, 0.5, 1.0] } }
+            ],
+            "meshes": [{ "primitives": [
+                { "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }, "material": 0 },
+                { "attributes": { "POSITION": 0 }, "material": 1 },
+                { "attributes": { "POSITION": 0 }, "material": 2 },
+                { "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }, "material": 3 }
+            ] }],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" },
+                { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2" }
+            ],
+            "bufferViews": [{ "buffer": 0, "byteLength": 36 }, { "buffer": 0, "byteOffset": 36, "byteLength": 24 }],
+            "buffers": [{ "uri": "m.bin", "byteLength": 64 }]
+        });
+        let path = d.join("m.gltf");
+        std::fs::write(&path, gltf.to_string()).unwrap();
+        let m = crate::mesh::load_model(&path.to_string_lossy()).unwrap();
+        assert!(m.materials[0].ends_with("leaf.png"), "spec/gloss diffuse texture used: {:?}", m.materials);
+        assert_eq!(m.material_alpha[0], 1, "its alpha mode kept");
+        let px = |p: &str| image::open(p).unwrap().to_rgba8().get_pixel(0, 0).0;
+        assert_eq!(px(&m.materials[1]), [255, 0, 0, 255], "a color-only material shows its color");
+        let blue = px(&m.materials[2]);
+        assert!(blue[0] == 0 && blue[1] == 0 && (blue[2] as i32 - 128).abs() <= 1, "linear 0.214 is about sRGB 128: {blue:?}");
+        let t = px(&m.materials[3]);
+        assert!((t[0] as i32 - 188 * 200 / 255).abs() <= 2, "texture tinted by its color: {t:?}");
+        assert_eq!(m.uv.len(), m.pos.len(), "parts without UVs still get their color");
+    }
+
+    #[test]
+    fn transient_download_errors_are_retried() {
+        // (the retry rule only; the retries themselves are timing-based)
+        for e in ["download stopped: connection reset", "https://x: status code 503", "timed out reading", "status code 429"] {
+            assert!(transient(e), "{e}");
+        }
+        for e in ["status code 404", "status code 401", "Not allowed: http://x", "download is over 1 GB", "cancelled"] {
+            assert!(!transient(e), "{e}");
+        }
     }
 }
 
@@ -4017,7 +4285,7 @@ fn cut_out_and_see_through_textures() {
 // Source map (.bsp) import
 // ---------------------------------------------------------------------------
 
-mod bsp_import {
+pub(crate) mod bsp_import {
     use crate::bsp::{self, Bsp, Options};
     use crate::map::{Kind, Map};
     use crate::mount::Layered;
@@ -4259,6 +4527,338 @@ mod bsp_import {
         bsp::import_parsed(&bsp, "synthetic", &content, &opts, &|_| {}).unwrap()
     }
 
+    fn import_with(files: &HashMap<String, Vec<u8>>, b: &[u8]) -> bsp::Imported {
+        let bsp = Bsp::parse(b).unwrap();
+        let content = Layered { files, dirs: Vec::new(), base: None };
+        let opts = Options { scale: 0.07, spawn_size: Vec3::new(6.0, 0.2, 6.0), props: true };
+        bsp::import_parsed(&bsp, "synthetic", &content, &opts, &|_| {}).unwrap()
+    }
+
+    /// A material whose texture file isn't installed is reported by name,
+    /// with the texture it wanted and how many faces it leaves untextured.
+    #[test]
+    fn bsp_missing_textures_are_named() {
+        let b = synthetic_bsp();
+        let mut files = Bsp::parse(&b).unwrap().pak;
+        files.insert("materials/test/checker.vmt".into(), b"\"LightmappedGeneric\" { \"$basetexture\" \"test/not_installed\" }".to_vec());
+        let imp = import_with(&files, &b);
+        let lines = &imp.report.missing_materials;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("test/checker") && lines[0].contains("test/not_installed isn't installed"), "{}", lines[0]);
+        assert!(lines[0].contains("11 brush faces") && lines[0].contains("16 terrain faces"), "says what uses it: {}", lines[0]);
+        assert!(imp.report.summary().contains("1 materials not found"));
+        assert_eq!(imp.report.textures, 0, "nothing claims to be textured");
+
+        // no material at all
+        files.remove("materials/test/checker.vmt");
+        files.remove("materials/test/checker.vtf");
+        let imp = import_with(&files, &b);
+        assert!(imp.report.missing_materials[0].starts_with("test/checker: material not found"), "{:?}", imp.report.missing_materials);
+    }
+
+    /// $alphatest / $translucent in a map's materials reach the textures;
+    /// a picture with alpha but no such setting stays solid (no invented holes).
+    #[test]
+    fn bsp_material_transparency() {
+        let b = synthetic_bsp();
+        let mut files = Bsp::parse(&b).unwrap().pak;
+        let alpha_of = |files: &HashMap<String, Vec<u8>>| import_with(files, &b).textures[0].alpha;
+        assert_eq!(alpha_of(&files), 0, "plain material: solid");
+        files.insert("materials/test/checker.vmt".into(), b"\"LightmappedGeneric\" { \"$basetexture\" \"test/checker\" \"$alphatest\" \"1\" }".to_vec());
+        assert_eq!(alpha_of(&files), 1, "$alphatest: cut out");
+        files.insert("materials/test/checker.vmt".into(), b"\"LightmappedGeneric\" { \"$basetexture\" \"test/checker\" \"$translucent\" 1 }".to_vec());
+        assert_eq!(alpha_of(&files), 2, "$translucent: see-through");
+        files.insert("materials/test/checker.vmt".into(), b"\"LightmappedGeneric\" { \"$basetexture\" \"test/checker\" \"$alphatest\" \"0\" }".to_vec());
+        assert_eq!(alpha_of(&files), 0, "$alphatest 0 is off");
+    }
+
+    /// The Inspector's prop Transparency: reads and rewrites the model's
+    /// .mtl, and the model then loads with that mode.
+    #[test]
+    fn prop_transparency_setting() {
+        let d = super::out_dir("prop_alpha");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let img = image::RgbaImage::from_fn(4, 4, |x, _| image::Rgba([0, 200, 0, if x < 2 { 0 } else { 255 }]));
+        img.save(d.join("leaf.png")).unwrap();
+        std::fs::write(d.join("bush.mtl"), "# Imported by Anvil\n\nnewmtl m0_leaf\nKd 1 1 1\nmap_Kd leaf.png\n\nnewmtl m1_plain\nKd 1 0 0\n").unwrap();
+        std::fs::write(d.join("bush.obj"), "mtllib bush.mtl\nv 0 0 0\nv 1 0 0\nv 1 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nusemtl m0_leaf\nf 1/1 2/2 3/3\n").unwrap();
+        let obj = d.join("bush.obj").to_string_lossy().to_string();
+        assert_eq!(crate::model_alpha::model_alpha(&obj), Some(0));
+        let load = |p: &str| crate::mesh::load_model(p).unwrap().material_alpha;
+        assert_eq!(load(&obj)[0], 0);
+        for mode in [1u8, 2, 0, 1] {
+            assert_eq!(crate::model_alpha::set_model_alpha(&obj, mode).unwrap(), 1, "one textured material");
+            assert_eq!(crate::model_alpha::model_alpha(&obj), Some(mode));
+            assert_eq!(load(&obj)[0], mode, "mode {mode} reaches the loaded model");
+        }
+        let mtl = std::fs::read_to_string(d.join("bush.mtl")).unwrap();
+        assert_eq!(mtl.matches("map_d").count(), 1, "no duplicate lines after several changes:\n{mtl}");
+        assert!(mtl.contains("newmtl m1_plain\nKd 1 0 0"), "untextured material untouched");
+        // not an OBJ / no material file: nothing to set
+        assert_eq!(crate::model_alpha::model_alpha(&d.join("leaf.png").to_string_lossy()), None);
+    }
+
+    /// Edits the synthetic map in place: texture axes, texture size, where
+    /// the world brush is, and (optionally) a slanted top face.
+    fn patched_bsp(s: [f32; 4], t: [f32; 4], size: (i32, i32), shift: [f32; 3], slant: bool) -> Vec<u8> {
+        let mut b = synthetic_bsp();
+        let lump = |b: &[u8], i: usize| {
+            let o = 8 + 16 * i;
+            (i32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize, i32::from_le_bytes(b[o + 4..o + 8].try_into().unwrap()) as usize)
+        };
+        let put = |b: &mut Vec<u8>, at: usize, v: f32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        // texinfo 0 (the textured one)
+        let (ti, _) = lump(&b, 6);
+        for k in 0..4 {
+            put(&mut b, ti + k * 4, s[k]);
+            put(&mut b, ti + 16 + k * 4, t[k]);
+        }
+        // texdata 0 size
+        let (td, _) = lump(&b, 2);
+        b[td + 16..td + 20].copy_from_slice(&size.0.to_le_bytes());
+        b[td + 20..td + 24].copy_from_slice(&size.1.to_le_bytes());
+        // the world brush's six planes: move them, maybe tilt the top
+        let (pl, _) = lump(&b, 1);
+        for i in 0..6 {
+            let o = pl + i * 20;
+            let n: Vec<f32> = (0..3).map(|k| f32::from_le_bytes(b[o + k * 4..o + k * 4 + 4].try_into().unwrap())).collect();
+            let d = f32::from_le_bytes(b[o + 12..o + 16].try_into().unwrap());
+            let mut nd = d + n[0] * shift[0] + n[1] * shift[1] + n[2] * shift[2];
+            if slant && i == 4 {
+                // top: through (64, 32, 32) + shift, leaning
+                let nn = glam::Vec3::new(0.35, -0.2, 1.0).normalize();
+                for k in 0..3 {
+                    put(&mut b, o + k * 4, nn[k]);
+                }
+                nd = nn.dot(glam::Vec3::new(64.0, 32.0, 32.0) + glam::Vec3::from(shift));
+            }
+            put(&mut b, o + 12, nd);
+        }
+        b
+    }
+
+    /// Hammer alignment survives exactly: rotated, scaled, mirrored and
+    /// offset textures, a non-square texture, far-negative coordinates and a
+    /// slanted face. Every triangle corner the renderer draws gets Source's
+    /// own UV, and the UV editor shows the same numbers.
+    #[test]
+    fn bsp_uv_alignment_fixtures() {
+        let (c, sn) = (30f32.to_radians().cos(), 30f32.to_radians().sin());
+        let cases: Vec<(&str, [f32; 4], [f32; 4], (i32, i32), [f32; 3], bool)> = vec![
+            ("world aligned", [4.0, 0.0, 0.0, 0.0], [0.0, -4.0, 0.0, 0.0], (64, 32), [0.0; 3], false),
+            ("rotated 30 degrees", [4.0 * c, 4.0 * sn, 0.0, 17.0], [-4.0 * sn, 4.0 * c, 0.0, -9.0], (256, 256), [0.0; 3], false),
+            ("scale 0.5 + offset", [2.0, 0.0, 0.0, 300.0], [0.0, 0.0, -2.0, -125.0], (512, 512), [0.0; 3], false),
+            ("scale 2", [0.5, 0.0, 0.0, 3.0], [0.0, 0.0, -0.5, 1.0], (512, 512), [0.0; 3], false),
+            ("mirrored", [-4.0, 0.0, 0.0, 64.0], [0.0, 4.0, 0.0, 0.0], (128, 512), [0.0; 3], false),
+            ("non-square, far negative", [4.0, 0.0, 0.0, 37.0], [0.0, 0.0, -4.0, 11.0], (128, 512), [-6000.0, -3500.0, -900.0], false),
+            ("slanted face", [3.0, 1.0, 0.5, 5.0], [0.2, -0.4, -4.0, 2.0], (256, 128), [-300.0, 700.0, 40.0], true),
+        ];
+        let k = 0.07f64;
+        for (what, s, t, size, shift, slant) in cases {
+            let b = patched_bsp(s, t, size, shift, slant);
+            let bsp = Bsp::parse(&b).unwrap();
+            let content = Layered { files: &bsp.pak, dirs: Vec::new(), base: None };
+            let opts = Options { scale: k as f32, spawn_size: Vec3::ONE, props: false };
+            let imp = bsp::import_parsed(&bsp, "uv", &content, &opts, &|_| {}).unwrap();
+            let mut map = Map::default();
+            let ids = bsp::apply(&mut map, imp);
+            let o = map.objects.iter().find(|o| ids.contains(&o.id) && o.folder.and_then(|f| map.folder(f)).is_some_and(|f| f.name == "World")).unwrap().clone();
+            let mut cache = crate::mesh::ModelCache::default();
+            let wm = crate::mesh::world_mesh(&o, &map.textures, &mut cache);
+            let (w, h) = (size.0 as f64, size.1 as f64);
+            let source_uv = |p: Vec3| {
+                let q = DVec3::new(p.x as f64, -(p.z as f64), p.y as f64) / k;
+                let u = (q.x * s[0] as f64 + q.y * s[1] as f64 + q.z * s[2] as f64 + s[3] as f64) / w;
+                let v = (q.x * t[0] as f64 + q.y * t[1] as f64 + q.z * t[2] as f64 + t[3] as f64) / h;
+                (u, v)
+            };
+            let mut n = 0;
+            for (ti, tr) in wm.mesh.tris.iter().enumerate() {
+                for c in 0..3 {
+                    let (su, sv) = source_uv(wm.pos[tr[c] as usize]);
+                    let uv = wm.tri_uv[ti][c];
+                    // relative error (UVs far from 0 lose a little precision in f32)
+                    let tol = 2e-3 * (1.0 + su.abs().max(sv.abs()) / 100.0);
+                    assert!((uv.x as f64 - su).abs() < tol && (uv.y as f64 - sv).abs() < tol, "{what}: uv {uv} vs Source ({su}, {sv})");
+                    n += 1;
+                }
+            }
+            assert!(n >= 24, "{what}: {n} corners checked");
+            if slant {
+                let Kind::Mesh { verts, .. } = &o.kind else { panic!() };
+                assert!(verts.len() >= 8, "{what}: slanted brush built");
+            }
+            // the UV editor shows exactly what the renderer draws, face by face
+            let Kind::Mesh { faces, .. } = &o.kind else { panic!() };
+            for f in 0..faces.len() {
+                let Some(ft) = o.face_tex[f].clone() else { continue };
+                let td = map.textures.iter().find(|x| Some(x.id) == ft.texture).unwrap();
+                let ed = crate::uv_editor::target_uvs(&o, Some(f), td, &ft.params, &mut cache);
+                let mesh = crate::mesh::local_mesh(&o, &mut cache);
+                let drawn: Vec<[glam::Vec2; 3]> = (0..mesh.tris.len()).filter(|ti| crate::mesh::tri_face_key(&o, &mesh, *ti) == Some(f)).map(|ti| wm.tri_uv[ti]).collect();
+                assert_eq!(ed.len(), drawn.len(), "{what}: face {f}");
+                for (a, b) in ed.iter().zip(&drawn) {
+                    for c in 0..3 {
+                        assert!((a[c] - b[c]).length() < 1e-4, "{what}: UV editor {a:?} vs view {b:?}");
+                    }
+                }
+            }
+            // moving the object keeps the texture on the brush (like Hammer's texture lock)
+            let mut moved = o.clone();
+            moved.pos += Vec3::new(3.0, 1.0, -2.0);
+            let wm2 = crate::mesh::world_mesh(&moved, &map.textures, &mut cache);
+            assert!(wm2.tri_uv.iter().zip(&wm.tri_uv).all(|(a, b)| (0..3).all(|c| (a[c] - b[c]).length() < 1e-3)), "{what}: moving keeps UVs");
+        }
+    }
+
+    /// Visible faces of different objects that lie on one plane, face the
+    /// same way and overlap (area in square studs): what flickers on screen.
+    fn coplanar_overlap(objs: &[&crate::map::Object], scale: f64) -> f64 {
+        let mut faces: Vec<(usize, glam::DVec3, f64, Vec<glam::DVec3>)> = Vec::new();
+        for (oi, o) in objs.iter().enumerate() {
+            let Kind::Mesh { verts, faces: fs } = &o.kind else { continue };
+            for (fi, f) in fs.iter().enumerate() {
+                if o.face_tex.get(fi).cloned().flatten().is_none() {
+                    continue;
+                }
+                // in Source units, where the map's own precision lives
+                let w: Vec<glam::DVec3> = f.iter().map(|i| (o.pos + verts[*i as usize]).as_dvec3() / scale).collect();
+                let n = crate::polymesh::newell(verts, f).as_dvec3().normalize();
+                faces.push((oi, n, n.dot(w[0]), w));
+            }
+        }
+        let mut total = 0.0;
+        for i in 0..faces.len() {
+            for j in i + 1..faces.len() {
+                let (a, b) = (&faces[i], &faces[j]);
+                if a.0 == b.0 || a.1.dot(b.1) < 0.999 || (a.2 - b.2).abs() > 0.02 {
+                    continue;
+                }
+                let outside: f64 = bsp::subtract_coplanar(&a.3, &b.3, a.1).iter().map(|p| area(p)).sum();
+                let ov = area(&a.3) - outside;
+                if ov > 0.5 && std::env::var("ANVIL_DEBUG_OVERLAP").is_ok() {
+                    eprintln!("overlap {ov:.2}: {} vs {} n {:?} d {:.3}/{:.3} a {:?}", objs[a.0].name, objs[b.0].name, a.1, a.2, b.2, a.3);
+                }
+                total += ov;
+            }
+        }
+        total
+    }
+
+    fn area(p: &[glam::DVec3]) -> f64 {
+        let mut a = glam::DVec3::ZERO;
+        for k in 1..p.len().saturating_sub(1) {
+            a += (p[k] - p[0]).cross(p[k + 1] - p[0]);
+        }
+        a.length() * 0.5
+    }
+
+    /// Two world brushes overlapping (their tops, bottoms and sides on the
+    /// same planes): the earlier one gives up the covered part of each shared
+    /// face, so nothing flickers and nothing is left uncovered.
+    #[test]
+    fn bsp_overlapping_brushes_dont_fight() {
+        use crate::bsp::{Brush, BrushSide, Model, TexData, TexInfo};
+        let mut planes = Vec::new();
+        let mut plane = |n: [f64; 3], d: f64| -> u16 {
+            let n = DVec3::from(n);
+            match planes.iter().position(|(pn, pd): &(DVec3, f64)| (*pn - n).length() < 1e-9 && (pd - d).abs() < 1e-9) {
+                Some(i) => i as u16,
+                None => {
+                    planes.push((n, d));
+                    planes.len() as u16 - 1
+                }
+            }
+        };
+        let mut sides = Vec::new();
+        let mut brushes = Vec::new();
+        for (mn, mx) in [([0.0, 0.0, 0.0], [128.0, 128.0, 64.0]), ([64.0, 0.0, 0.0], [192.0, 128.0, 64.0])] {
+            let first = sides.len() as i32;
+            for (n, d) in [([1.0, 0.0, 0.0], mx[0]), ([-1.0, 0.0, 0.0], -mn[0]), ([0.0, 1.0, 0.0], mx[1]), ([0.0, -1.0, 0.0], -mn[1]), ([0.0, 0.0, 1.0], mx[2]), ([0.0, 0.0, -1.0], -mn[2])] {
+                sides.push(BrushSide { plane: plane(n, d), texinfo: 0, dispinfo: 0, bevel: false });
+            }
+            brushes.push(Brush { first_side: first, num_sides: 6, contents: 1 });
+        }
+        let b = synthetic_bsp();
+        let pak = Bsp::parse(&b).unwrap().pak;
+        let bsp = Bsp {
+            version: 20,
+            planes,
+            texinfo: vec![TexInfo { s: [4.0, 0.0, 0.0, 0.0], t: [0.0, -4.0, 0.0, 0.0], flags: 0, texdata: 0 }],
+            texdata: vec![TexData { name: "test/checker".into(), width: 64, height: 64 }],
+            verts: Vec::new(),
+            edges: Vec::new(),
+            surfedges: Vec::new(),
+            faces: Vec::new(),
+            brushes,
+            sides,
+            models: vec![Model { origin: DVec3::ZERO, headnode: -1, first_face: 0, num_faces: 0 }],
+            nodes: Vec::new(),
+            leafs: vec![(1, 0, 2)],
+            leafbrushes: vec![0, 1],
+            dispinfo: Vec::new(),
+            dispverts: Vec::new(),
+            entities: Vec::new(),
+            static_props: Vec::new(),
+            pak,
+            warnings: Vec::new(),
+        };
+        let content = Layered { files: &bsp.pak, dirs: Vec::new(), base: None };
+        let opts = Options { scale: 1.0, spawn_size: Vec3::ONE, props: false };
+        let imp = bsp::import_parsed(&bsp, "overlap", &content, &opts, &|_| {}).unwrap();
+        let objs: Vec<&crate::map::Object> = imp.objects.iter().map(|(o, _)| o).collect();
+        assert_eq!(objs.len(), 2);
+        assert!(coplanar_overlap(&objs, 1.0) < 1e-3, "overlap left: {}", coplanar_overlap(&objs, 1.0));
+        // the shared top is covered exactly once: 192 x 128 (Source units = studs here)
+        let mut top = 0.0;
+        for o in &objs {
+            let Kind::Mesh { verts, faces } = &o.kind else { panic!() };
+            for f in faces {
+                if crate::polymesh::newell(verts, f).y > 0.5 {
+                    let w: Vec<DVec3> = f.iter().map(|i| (o.pos + verts[*i as usize]).as_dvec3()).collect();
+                    top += area(&w);
+                }
+            }
+        }
+        assert!((top - 192.0 * 128.0).abs() < 1.0, "top area {top}");
+        // the later brush keeps its whole faces; the earlier one is still editable
+        let Kind::Mesh { faces, .. } = &objs[1].kind else { panic!() };
+        assert_eq!(faces.len(), 6);
+        assert!(objs[0].face_tex.iter().all(|f| f.as_ref().is_some_and(|f| f.uv.is_some())));
+    }
+
+    #[test]
+    fn coplanar_subtraction_pieces() {
+        let sq = |x0: f64, y0: f64, x1: f64, y1: f64| vec![DVec3::new(x0, y0, 0.0), DVec3::new(x1, y0, 0.0), DVec3::new(x1, y1, 0.0), DVec3::new(x0, y1, 0.0)];
+        let n = DVec3::Z;
+        let a = sq(0.0, 0.0, 10.0, 10.0);
+        let sum = |v: Vec<Vec<DVec3>>| v.iter().map(|p| area(p)).sum::<f64>();
+        assert!((sum(bsp::subtract_coplanar(&a, &sq(5.0, 5.0, 20.0, 20.0), n)) - 75.0).abs() < 1e-6, "corner bite");
+        assert!((sum(bsp::subtract_coplanar(&a, &sq(2.0, 2.0, 4.0, 4.0), n)) - 96.0).abs() < 1e-6, "hole in the middle");
+        assert!(bsp::subtract_coplanar(&a, &sq(-1.0, -1.0, 11.0, 11.0), n).is_empty(), "fully covered");
+        assert!((sum(bsp::subtract_coplanar(&a, &sq(20.0, 0.0, 30.0, 10.0), n)) - 100.0).abs() < 1e-6, "apart");
+        let mut cw = sq(5.0, 5.0, 20.0, 20.0);
+        cw.reverse();
+        assert!((sum(bsp::subtract_coplanar(&a, &cw, n)) - 75.0).abs() < 1e-6, "either winding");
+    }
+
+    /// The user's real test map: after import, no visible faces fight.
+    #[test]
+    #[ignore]
+    fn real_bsp_has_no_fighting_faces() {
+        let p = std::env::var("ANVIL_UVDEBUG_BSP").unwrap();
+        let dir = std::env::var("ANVIL_UVDEBUG_DIR").unwrap_or_default();
+        let bsp = Bsp::parse(&std::fs::read(p).unwrap()).unwrap();
+        let content = Layered { files: &bsp.pak, dirs: vec![std::path::PathBuf::from(dir)], base: None };
+        let opts = Options { scale: 0.07, spawn_size: Vec3::ONE, props: false };
+        let imp = bsp::import_parsed(&bsp, "real", &content, &opts, &|_| {}).unwrap();
+        let objs: Vec<&crate::map::Object> = imp.objects.iter().filter(|(_, g)| *g == bsp::Group::World).map(|(o, _)| o).collect();
+        let a = coplanar_overlap(&objs, 0.07);
+        eprintln!("{} world objects, fighting area {a:.4} square Source units; {}", objs.len(), imp.report.summary());
+        assert!(a < 10.0, "faces still fighting");
+    }
+
     #[test]
     fn bsp_brushes_become_textured_meshes() {
         let b = synthetic_bsp();
@@ -4418,4 +5018,275 @@ mod bsp_import {
         assert_eq!(imp.report.lights, 9);
         let _ = HashMap::<u8, u8>::new();
     }
+}
+
+
+/// Imports a real map with generated debug textures (see uvdebug.py) from
+/// ANVIL_UVDEBUG_DIR and saves it to ANVIL_UVDEBUG_OUT, to look at.
+#[test]
+#[ignore]
+fn bsp_uv_debug_import() {
+    let dir = std::env::var("ANVIL_UVDEBUG_DIR").unwrap();
+    let out = std::env::var("ANVIL_UVDEBUG_OUT").unwrap();
+    let p = std::env::var("ANVIL_UVDEBUG_BSP").unwrap();
+    let bsp = crate::bsp::Bsp::parse(&std::fs::read(p).unwrap()).unwrap();
+    let content = crate::mount::Layered { files: &bsp.pak, dirs: vec![std::path::PathBuf::from(dir)], base: None };
+    let opts = crate::bsp::Options { scale: 0.07, spawn_size: Vec3::new(6.0, 0.2, 6.0), props: false };
+    let imp = crate::bsp::import_parsed(&bsp, "town", &content, &opts, &|_| {}).unwrap();
+    eprintln!("{} missing {:?}", imp.report.summary(), imp.report.missing_materials);
+    let mut map = Map::default();
+    crate::bsp::apply(&mut map, imp);
+    map.save(std::path::Path::new(&out)).unwrap();
+}
+
+
+// ---------------------------------------------------------------------------
+// Wall tool trim
+// ---------------------------------------------------------------------------
+
+mod wall_trim {
+    use crate::building::wall_box;
+    use crate::map::{Kind, Map, Material, Object};
+    use crate::trim::{wall_joins, wall_trim_pieces};
+    use glam::Vec3;
+
+    fn corners(o: &Object) -> Vec<Vec3> {
+        let Kind::Brush { size, .. } = o.kind else { panic!() };
+        let h = size * 0.5;
+        (0..8).map(|i| o.to_world(Vec3::new(if i & 1 != 0 { h.x } else { -h.x }, if i & 2 != 0 { h.y } else { -h.y }, if i & 4 != 0 { h.z } else { -h.z }))).collect()
+    }
+
+    fn bounds(o: &Object) -> (Vec3, Vec3) {
+        corners(o).iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)))
+    }
+
+    #[test]
+    fn free_wall_gets_flush_strips() {
+        // a wall along X from (0,0,0) to (20,0,0): 1 thick, 12 tall, on y = 2
+        let mut w = wall_box(Vec3::ZERO, Vec3::new(20.0, 0.0, 0.0), 1.0, 12.0, 2.0, [200; 3], Material::Concrete).unwrap();
+        w.name = "Wall_1".into();
+        let (h, d) = (0.8, 0.25);
+        let t = wall_trim_pieces(&w, [false, false], h, d, true, true, [1, 2, 3]);
+        assert_eq!(t.len(), 4, "baseboard + crown, both sides");
+        for p in &t {
+            let (mn, mx) = bounds(p);
+            assert!((mn.x - 0.0).abs() < 1e-4 && (mx.x - 20.0).abs() < 1e-4, "{}: as long as the wall, no overhang ({mn} {mx})", p.name);
+            let side_a = mn.z > 0.0;
+            if side_a {
+                assert!((mn.z - 0.5).abs() < 1e-4 && (mx.z - 0.75).abs() < 1e-4, "{}: on the face, d deep", p.name);
+            } else {
+                assert!((mx.z + 0.5).abs() < 1e-4 && (mn.z + 0.75).abs() < 1e-4, "{}", p.name);
+            }
+            if p.name.contains("baseboard") {
+                assert!((mn.y - 2.0).abs() < 1e-4 && (mx.y - 2.8).abs() < 1e-4, "baseboard sits on the floor: {mn} {mx}");
+            } else {
+                assert!((mx.y - 14.0).abs() < 1e-4 && (mn.y - 13.2).abs() < 1e-4, "crown at the top: {mn} {mx}");
+            }
+            assert!(p.name.starts_with("Trim Wall_1 "), "doors cut pieces named Trim…: {}", p.name);
+            assert_eq!(p.color, [1, 2, 3]);
+        }
+        // nothing picked: nothing made; a huge trim can't be taller than ~half the wall
+        assert!(wall_trim_pieces(&w, [false; 2], h, d, false, false, [0; 3]).is_empty());
+        let big = wall_trim_pieces(&w, [false; 2], 100.0, d, true, false, [0; 3]);
+        let Kind::Brush { size, .. } = big[0].kind else { panic!() };
+        assert!(size.y <= 12.0 * 0.45 + 1e-4);
+    }
+
+    #[test]
+    fn rotated_wall_strips_follow_it() {
+        let a = Vec3::new(3.0, 0.0, -4.0);
+        let b = a + Vec3::new(10.0, 0.0, 10.0);
+        let mut w = wall_box(a, b, 1.0, 10.0, 0.0, [200; 3], Material::Concrete).unwrap();
+        w.name = "Wall_2".into();
+        let t = wall_trim_pieces(&w, [false, false], 0.8, 0.25, true, false, [9; 3]);
+        assert_eq!(t.len(), 2);
+        let dir = (b - a).normalize();
+        let side = Vec3::new(-dir.z, 0.0, dir.x);
+        for p in &t {
+            assert!((p.rot.y - w.rot.y).abs() < 1e-4);
+            // the strip's center is beside the wall's center line, half a wall + half a strip out
+            let rel = p.pos - Vec3::new(w.pos.x, p.pos.y, w.pos.z);
+            assert!((rel.dot(side).abs() - (0.5 + 0.125)).abs() < 1e-3, "{}: {}", p.name, rel.dot(side));
+            assert!(rel.dot(dir).abs() < 1e-3, "centered along the wall");
+        }
+    }
+
+    #[test]
+    fn corners_join_and_neighbours_update() {
+        let mut map = Map::default();
+        let mut w1 = wall_box(Vec3::ZERO, Vec3::new(20.0, 0.0, 0.0), 1.0, 12.0, 0.0, [200; 3], Material::Concrete).unwrap();
+        w1.name = "Wall_1".into();
+        let id1 = map.add(w1);
+        let w1 = map.get(id1).unwrap().clone();
+        assert_eq!(wall_joins(&map, &w1), [false, false]);
+        let mut w2 = wall_box(Vec3::new(20.0, 0.0, 0.0), Vec3::new(20.0, 0.0, 15.0), 1.0, 12.0, 0.0, [200; 3], Material::Concrete).unwrap();
+        w2.name = "Wall_2".into();
+        let id2 = map.add(w2);
+        let (w1, w2) = (map.get(id1).unwrap().clone(), map.get(id2).unwrap().clone());
+        // which end of each wall is at the corner (20, 0)
+        let j1 = wall_joins(&map, &w1);
+        let j2 = wall_joins(&map, &w2);
+        assert_eq!(j1.iter().filter(|x| **x).count(), 1);
+        assert_eq!(j2.iter().filter(|x| **x).count(), 1);
+        let t1 = wall_trim_pieces(&w1, j1, 0.8, 0.25, true, false, [0; 3]);
+        for p in &t1 {
+            let (mn, mx) = bounds(p);
+            assert!((mn.x - 0.0).abs() < 1e-4, "free end stays flush");
+            assert!((mx.x - (20.0 + 0.5 + 0.25)).abs() < 1e-4, "corner end runs past to meet the other wall's strip: {mx}");
+        }
+        // the outside strips of the two walls meet exactly at the outside corner
+        let t2 = wall_trim_pieces(&w2, j2, 0.8, 0.25, true, false, [0; 3]);
+        let out1 = t1.iter().map(bounds).max_by(|a, b| a.1.x.total_cmp(&b.1.x)).unwrap();
+        let out2 = t2.iter().map(bounds).min_by(|a, b| a.0.z.total_cmp(&b.0.z)).unwrap();
+        assert!((out1.1.x - out2.1.x).abs() < 1e-4 && (out1.0.z - out2.0.z).abs() < 1e-4, "outside corner closed: {out1:?} {out2:?}");
+    }
+
+    #[test]
+    fn wall_trim_settings_are_saved() {
+        let mut s = crate::settings::Settings::default();
+        assert!(!s.wall_trim, "off unless turned on");
+        s.wall_trim = true;
+        s.wall_trim_crown = true;
+        let text = serde_json::to_string(&s).unwrap();
+        let back: crate::settings::Settings = serde_json::from_str(&text).unwrap();
+        assert!(back.wall_trim && back.wall_trim_crown && back.wall_trim_baseboard);
+        // settings saved by older versions (no such fields) still load
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for k in ["wall_trim", "wall_trim_baseboard", "wall_trim_crown"] {
+            v.as_object_mut().unwrap().remove(k);
+        }
+        let old: crate::settings::Settings = serde_json::from_value(v).unwrap();
+        assert!(!old.wall_trim);
+    }
+
+    #[test]
+    fn doors_cut_wall_trim() {
+        use crate::building::{opening_reach, trim_hole};
+        use crate::map::Hole;
+        let mut w = wall_box(Vec3::ZERO, Vec3::new(20.0, 0.0, 0.0), 1.0, 12.0, 0.0, [200; 3], Material::Concrete).unwrap();
+        w.name = "Wall_1".into();
+        let t = wall_trim_pieces(&w, [false; 2], 0.8, 0.25, true, false, [0; 3]);
+        // a door 4 wide in the middle, floor to 8 high (wall-local)
+        let door = Hole { min: Vec3::new(-2.0, -6.0, -1.0), max: Vec3::new(2.0, 2.0, 1.0) };
+        let c = opening_reach(&w, &door, 1.25);
+        for p in &t {
+            assert!(trim_hole(p, &c).is_some(), "{} is cut by the door", p.name);
+        }
+        let _ = Kind::Target {};
+        let _: Option<Object> = None;
+    }
+}
+
+/// Times every step of a real Sketchfab download (token from ANVIL_SF_TOKEN,
+/// model ids from ANVIL_SF_UIDS): the API call, the download (GLB and the
+/// zipped glTF), unzipping, parsing and decoding the textures.
+#[test]
+#[ignore]
+fn sketchfab_profile() {
+    use crate::plugin_web as w;
+    use std::time::Instant;
+    let token = crate::secure::unprotect(&std::env::var("ANVIL_SF_TOKEN").unwrap()).expect("token decrypts");
+    let uids: Vec<String> = std::env::var("ANVIL_SF_UIDS").unwrap().split(',').map(|s| s.to_string()).collect();
+    let hosts: Vec<String> = ["api.sketchfab.com", "media.sketchfab.com", "sketchfab.com", "sketchfab-prod-media.s3.amazonaws.com"].iter().map(|s| s.to_string()).collect();
+    let dir = out_dir("sf_profile");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for uid in uids {
+        let t = Instant::now();
+        let api = format!("https://api.sketchfab.com/v3/models/{uid}/download");
+        let info = w::http_get(&api, &[("Authorization".into(), format!("Token {token}"))], &hosts).or_else(|_| w::http_get(&api, &[("Authorization".into(), format!("Bearer {token}"))], &hosts)).unwrap();
+        let t_api = t.elapsed();
+        let v: serde_json::Value = serde_json::from_str(&info).unwrap();
+        for kind in ["glb", "gltf"] {
+            let Some(url) = v[kind]["url"].as_str() else {
+                eprintln!("{uid}: no {kind}");
+                continue;
+            };
+            let name = format!("{uid}.{}", if kind == "glb" { "glb" } else { "zip" });
+            let t = Instant::now();
+            let id = w::start_download(url.to_string(), &name, Vec::new(), hosts.clone(), dir.clone());
+            loop {
+                let (s, _, _) = w::job(id);
+                if s == "done" || s.starts_with("error") {
+                    assert_eq!(s, "done");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let t_dl = t.elapsed();
+            let path = dir.join(&name);
+            let mb = std::fs::metadata(&path).unwrap().len() as f64 / 1e6;
+            let t = Instant::now();
+            let model = if kind == "gltf" {
+                let out = w::unzip_in(&path, &dir).unwrap();
+                w::find_files(std::path::Path::new(&out), "gltf", &dir)[0].clone()
+            } else {
+                path.to_string_lossy().to_string()
+            };
+            let t_unzip = t.elapsed();
+            let t = Instant::now();
+            let m = crate::mesh::load_model(&model).unwrap();
+            let t_parse = t.elapsed();
+            let t = Instant::now();
+            let mut n = 0;
+            for img in m.materials.iter().chain(&m.material_normals).filter(|s| !s.is_empty()) {
+                assert!(crate::texture::load(img, 1024).is_some(), "{img} decodes");
+                n += 1;
+            }
+            let t_tex = t.elapsed();
+            eprintln!(
+                "{uid} {kind}: api {:?}, download {mb:.1} MB in {:?} ({:.1} MB/s), unzip {:?}, parse {:?} ({} tris), {n} textures decoded in {:?}",
+                t_api,
+                t_dl,
+                mb / t_dl.as_secs_f64().max(1e-3),
+                t_unzip,
+                t_parse,
+                m.tris.len(),
+                t_tex
+            );
+        }
+    }
+}
+
+/// The outside playtest's starts: every spawn pad, feet on its top, facing
+/// the pad's own way (its -Z, as Anvil's playtest has it), in meters; a map
+/// without pads starts on top of what's under its middle.
+#[test]
+fn play_export_starts_follow_spawn_pads() {
+    use crate::map::{Kind, Map, Material, Object, Shape};
+    let k = 0.28;
+    let mut map = Map::default();
+    map.add(Object::brush(Shape::Box, Vec3::new(40.0, 1.0, 40.0), Vec3::new(0.0, -0.5, 0.0), [200; 3], Material::Concrete));
+    let mut a = Object::new(Kind::Spawn { size: Vec3::new(6.0, 0.2, 6.0) }, Vec3::new(10.0, 0.1, -4.0), [0, 255, 0], Material::Plastic);
+    a.rot.y = 90.0;
+    map.add(a.clone());
+    let mut b = a.clone();
+    b.pos = Vec3::new(-8.0, 3.1, 2.0);
+    b.rot.y = 225.0;
+    map.add(b.clone());
+    let mut cache = crate::mesh::ModelCache::default();
+    let gl: serde_json::Value = serde_json::from_slice(&crate::play_export::collision_gltf(&map, &mut cache, k, true)).unwrap();
+    let nodes = gl["nodes"].as_array().unwrap();
+    let node = |name: &str| nodes.iter().find(|n| n["name"] == name).unwrap_or_else(|| panic!("{name}"));
+    for (name, pad) in [("start anvil", &a), ("start anvil 2", &b)] {
+        let n = node(name);
+        let t: Vec<f32> = n["translation"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+        let feet = Vec3::new(t[0], t[1], t[2]);
+        assert!((feet - (pad.pos + Vec3::Y * 0.1) * k).length() < 1e-4, "{name}: feet on the pad's top, in meters: {feet}");
+        let r: Vec<f32> = n["rotation"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+        let q = glam::Quat::from_xyzw(r[0], r[1], r[2], r[3]);
+        let looks = q * Vec3::NEG_Z;
+        let pad_ahead = pad.rotation() * Vec3::NEG_Z;
+        assert!((looks - pad_ahead).length() < 1e-4, "{name}: looks the pad's way {pad_ahead}, not {looks}");
+        // and that's the way Anvil's own playtest faces you there (yaw = -rot.y)
+        let yaw = -pad.rot.y.to_radians();
+        assert!((Vec3::new(yaw.sin(), 0.0, -yaw.cos()) - pad_ahead).length() < 1e-4);
+    }
+    // no pads: on top of the floor under the middle
+    let mut bare = Map::default();
+    bare.add(Object::brush(Shape::Box, Vec3::new(40.0, 2.0, 40.0), Vec3::new(5.0, 1.0, 5.0), [200; 3], Material::Concrete));
+    let gl: serde_json::Value = serde_json::from_slice(&crate::play_export::collision_gltf(&bare, &mut cache, k, true)).unwrap();
+    let s = gl["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "start anvil").unwrap().clone();
+    let t: Vec<f32> = s["translation"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+    assert!((t[1] - 2.0 * k).abs() < 1e-4 && (t[0] - 5.0 * k).abs() < 1e-4, "on the floor's top, over its middle: {t:?}");
 }

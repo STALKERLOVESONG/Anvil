@@ -42,13 +42,15 @@ pub const TEMPLATE: &str = include_str!("../plugins/template.rhai");
 /// Earlier bundled versions (FNV-1a of the exact file). A plugins-folder copy
 /// that matches one of these is replaced with the new version on start.
 /// Every released version must be listed (a test checks the git tags).
-pub(crate) const OLD_BUILTINS: [(&str, u64); 4] = [
+pub(crate) const OLD_BUILTINS: [(&str, u64); 5] = [
     ("transform_gizmo.rhai", 0x732b_1b31_58d1_2ad5),
     ("transform_gizmo.rhai", 0x718d_635e_b156_c31e),
     // 0.2.0: saving the token failed (Rhai's trim() returns nothing)
     ("sketchfab.rhai", 0xf97e_6b8e_ce81_0d54),
     // 0.2.1: downloading failed (Rhai has no char is_alphanumeric)
     ("sketchfab.rhai", 0x9c62_f9af_0608_4fe4),
+    // 0.2.2 - 0.3.0: before smaller-download choice, background unzip, cancel
+    ("sketchfab.rhai", 0x0b54_e431_b106_04d8),
 ];
 
 pub(crate) fn fnv(b: &[u8]) -> u64 {
@@ -516,6 +518,12 @@ fn build_engine(ctx: &Rc<RefCell<Ctx>>) -> Engine {
         e.register_fn("job_status", |id: INT| -> String { w::job(id).0 });
         e.register_fn("job_file", |id: INT| -> String { w::job(id).1 });
         e.register_fn("job_progress", |id: INT| -> f64 { w::job(id).2 });
+        e.register_fn("job_cancel", |id: INT| w::cancel_job(id));
+        let c = ctx.clone();
+        e.register_fn("unzip_job", move |path: &str| -> INT {
+            let root = w::plugin_dir(&c.borrow().plugin);
+            w::start_unzip(std::path::PathBuf::from(path), root) as INT
+        });
         let c = ctx.clone();
         e.register_fn("unzip", move |path: &str| -> String {
             let root = w::plugin_dir(&c.borrow().plugin);

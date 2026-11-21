@@ -53,24 +53,48 @@ fn search() {
     state_set("msg", `${list.len()} downloadable models for "${q}"`);
 }
 
+// The download links for a model. Personal API tokens use "Token ...",
+// OAuth tokens "Bearer ...": the one that worked last time is tried first.
+fn download_info(uid, token) {
+    let api = "https://api.sketchfab.com/v3/models/" + uid + "/download";
+    let schemes = if st("auth", "Token") == "Bearer" { ["Bearer", "Token"] } else { ["Token", "Bearer"] };
+    for s in schemes {
+        let d = json_parse(http_get(api, #{ Authorization: s + " " + token }));
+        if type_of(d) == "map" && (type_of(d.gltf) == "map" || type_of(d.glb) == "map") {
+            state_set("auth", s);
+            return d;
+        }
+    }
+    ()
+}
+
+fn size_of(x) {
+    if type_of(x) == "map" && (type_of(x.size) == "i64" || type_of(x.size) == "f64") { x.size } else { -1 }
+}
+
 fn start_download(uid, name) {
     let token = secret_get("token");
     if token == "" { state_set("msg", "Save your Sketchfab API token first (top of this window)."); return; }
-    // Personal API tokens use "Token ...", OAuth tokens "Bearer ...": try both.
-    let api = "https://api.sketchfab.com/v3/models/" + uid + "/download";
-    let d = json_parse(http_get(api, #{ Authorization: "Token " + token }));
-    if type_of(d) != "map" || (type_of(d.gltf) != "map" && type_of(d.glb) != "map") {
-        d = json_parse(http_get(api, #{ Authorization: "Bearer " + token }));
+    for j in st("jobs", []) {
+        if !j.done && j.uid == uid { state_set("msg", name + " is already downloading"); return; }
     }
+    let d = download_info(uid, token);
     if type_of(d) != "map" {
         state_set("msg", "Sketchfab didn't give a download (wrong token, or the model isn't downloadable).");
         return;
     }
     // Anvil cleans up the file name itself (safe characters, keeps the extension)
     let file = uid + "_" + name;
+    // both kinds hold the same model: take the smaller download
+    let use_glb = type_of(d.glb) == "map";
+    if use_glb && type_of(d.gltf) == "map" {
+        let gs = size_of(d.glb);
+        let zs = size_of(d.gltf);
+        if gs > 0 && zs > 0 && zs < gs { use_glb = false; }
+    }
     let job = -1;
     let kind = "";
-    if type_of(d.glb) == "map" {
+    if use_glb {
         job = download(d.glb.url, file + ".glb");
         kind = "glb";
     } else if type_of(d.gltf) == "map" {
@@ -81,37 +105,52 @@ fn start_download(uid, name) {
         return;
     }
     let jobs = st("jobs", []);
-    jobs.push(#{ job: job, kind: kind, name: name, done: false });
+    jobs.push(#{ job: job, kind: kind, name: name, uid: uid, done: false, unzip: -1 });
     state_set("jobs", jobs);
     state_set("msg", "Downloading " + name + "…");
 }
 
-// called every frame while the window is open: finish downloads
+// called every frame while the window is open: finish downloads (unzipping
+// happens in the background too, so the editor never stalls)
 fn poll_jobs() {
     let jobs = st("jobs", []);
     let changed = false;
     for i in 0..jobs.len() {
         let j = jobs[i];
         if j.done { continue; }
-        let s = job_status(j.job);
-        if s == "done" {
-            let file = job_file(j.job);
-            if j.kind == "zip" {
-                let dir = unzip(file);
-                let found = if dir == "" { [] } else { find_files(dir, "gltf") };
+        if j.unzip >= 0 {
+            let u = job_status(j.unzip);
+            if u == "done" {
+                let found = find_files(job_file(j.unzip), "gltf");
                 if found.len() > 0 && import_model(found[0], j.name) {
                     state_set("msg", "Added " + j.name + " to the model library");
                 } else {
                     state_set("msg", "Downloaded " + j.name + " but couldn't find its .gltf");
                 }
-            } else if import_model(file, j.name) {
-                state_set("msg", "Added " + j.name + " to the model library");
+                j.done = true;
+            } else if u.starts_with("error") {
+                state_set("msg", j.name + ": " + u);
+                j.done = true;
             }
-            j.done = true;
+            jobs[i] = j;
+            changed = true;
+            continue;
+        }
+        let s = job_status(j.job);
+        if s == "done" {
+            let file = job_file(j.job);
+            if j.kind == "zip" {
+                j.unzip = unzip_job(file);
+            } else {
+                if import_model(file, j.name) {
+                    state_set("msg", "Added " + j.name + " to the model library");
+                }
+                j.done = true;
+            }
             jobs[i] = j;
             changed = true;
         } else if s.starts_with("error") {
-            state_set("msg", j.name + ": " + s);
+            state_set("msg", if s.contains("cancelled") { j.name + ": cancelled" } else { j.name + ": " + s });
             j.done = true;
             jobs[i] = j;
             changed = true;
@@ -146,7 +185,15 @@ fn panel() {
     if msg != "" { out.push(#{ t: "label", text: msg, small: true }); }
     for j in st("jobs", []) {
         if !j.done {
-            out.push(#{ t: "row", items: [ #{ t: "label", text: "Downloading " + j.name, small: true }, #{ t: "progress", value: job_progress(j.job) } ] });
+            if j.unzip >= 0 {
+                out.push(#{ t: "label", text: "Unpacking " + j.name + "…", small: true });
+            } else {
+                out.push(#{ t: "row", items: [
+                    #{ t: "label", text: "Downloading " + j.name, small: true },
+                    #{ t: "progress", value: job_progress(j.job) },
+                    #{ t: "button", id: "cancel:" + j.job, text: "Cancel" }
+                ] });
+            }
         }
     }
     out.push(#{ t: "separator" });
@@ -173,6 +220,9 @@ fn panel_event(id, value) {
         if t != "" && secret_set("token", t) { state_set("token_in", ""); state_set("msg", "Token saved."); }
     }
     else if id == "forget_token" { secret_set("token", ""); state_set("msg", "Token forgotten."); }
+    else if id.starts_with("cancel:") {
+        job_cancel(parse_int(id.sub_string(7)));
+    }
     else if id.starts_with("dl:") {
         let uid = id.sub_string(3);
         let name = uid;

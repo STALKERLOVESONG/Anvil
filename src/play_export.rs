@@ -96,15 +96,57 @@ pub fn solid_boxes(map: &Map, models: &mut ModelCache, k: f32, props: bool) -> V
     out
 }
 
-/// Where the player starts: the first spawn pad (feet on its top, facing
-/// the way it faces), or the middle of the map if there's none.
+/// Every spawn pad, in map order: where the feet go (on its top, meters)
+/// and the way it faces (its own -Z, as Anvil's playtest and Roblox have
+/// it) as a turn about Y in radians.
+pub fn starts(map: &Map, k: f32) -> Vec<(Vec3, f32)> {
+    map.objects
+        .iter()
+        .filter(|o| !o.hidden)
+        .filter_map(|o| match o.kind {
+            Kind::Spawn { size } => {
+                let top = o.to_world(Vec3::Y * size.y * 0.5);
+                let ahead = o.rotation() * Vec3::NEG_Z;
+                let yaw = (-ahead.x).atan2(-ahead.z); // the turn about Y that takes -Z to `ahead`
+                Some((top * k, yaw))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Where the player starts: the first spawn pad. Without one, on top of
+/// whatever is highest under the middle of the map (or its middle).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn start(map: &Map, k: f32) -> (Vec3, f32) {
-    for o in map.objects.iter().filter(|o| !o.hidden) {
-        if let Kind::Spawn { size } = o.kind {
-            return (Vec3::new(o.pos.x, o.pos.y + size.y * 0.5, o.pos.z) * k, o.rot.y.to_radians());
-        }
+    if let Some(s) = starts(map, k).first() {
+        return *s;
     }
     (Vec3::ZERO, 0.0)
+}
+
+/// `start` for a map with no spawn pad, from its solid boxes: on top of the
+/// highest box under the middle of everything.
+fn fallback_start(boxes: &[SolidBox]) -> (Vec3, f32) {
+    if boxes.is_empty() {
+        return (Vec3::ZERO, 0.0);
+    }
+    let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for b in boxes {
+        mn = mn.min(b.centre - b.size * 0.5);
+        mx = mx.max(b.centre + b.size * 0.5);
+    }
+    let mid = (mn + mx) * 0.5;
+    let top = boxes
+        .iter()
+        .filter(|b| {
+            let local = Quat::from_rotation_y(-b.yaw) * (Vec3::new(mid.x, b.centre.y, mid.z) - b.centre);
+            local.x.abs() <= b.size.x * 0.5 && local.z.abs() <= b.size.z * 0.5
+        })
+        .map(|b| b.centre.y + b.size.y * 0.5)
+        .fold(f32::MIN, f32::max);
+    let y = if top > f32::MIN { top } else { mx.y };
+    (Vec3::new(mid.x, y, mid.z), 0.0)
 }
 
 /// The boxes as a .gltf (JSON with its small buffer inside): a unit cube
@@ -139,10 +181,17 @@ pub fn collision_gltf(map: &Map, models: &mut ModelCache, k: f32, props: bool) -
             })
         })
         .collect();
-    // the start: an empty whose -Z is the way the player looks
-    let (feet, yaw) = start(map, k);
-    let q = Quat::from_rotation_y(-yaw);
-    nodes.push(json!({ "name": "start anvil", "translation": [feet.x, feet.y, feet.z], "rotation": [q.x, q.y, q.z, q.w] }));
+    // the starts: empties whose -Z is the way the player looks; the first
+    // spawn pad is "start anvil", the others "start anvil 2", "start anvil 3"…
+    let mut all = starts(map, k);
+    if all.is_empty() {
+        all.push(fallback_start(&boxes));
+    }
+    for (i, (feet, yaw)) in all.iter().enumerate() {
+        let q = Quat::from_rotation_y(*yaw);
+        let name = if i == 0 { "start anvil".to_string() } else { format!("start anvil {}", i + 1) };
+        nodes.push(json!({ "name": name, "translation": [feet.x, feet.y, feet.z], "rotation": [q.x, q.y, q.z, q.w] }));
+    }
     let doc = json!({
         "asset": { "version": "2.0", "generator": "Anvil level editor (collision for TRP)" },
         "scene": 0,

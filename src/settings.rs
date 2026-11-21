@@ -137,6 +137,10 @@ pub struct Settings {
     // Building trim
     pub trim_baseboard: bool,
     pub trim_crown: bool,
+    /// Wall tool: add trim strips to each new wall (both sides).
+    pub wall_trim: bool,
+    pub wall_trim_baseboard: bool,
+    pub wall_trim_crown: bool,
     pub trim_height: f32,
     pub trim_depth: f32,
     pub trim_color: [u8; 3],
@@ -263,6 +267,9 @@ impl Default for Settings {
             collisions: false,
             trim_baseboard: false,
             trim_crown: false,
+            wall_trim: false,
+            wall_trim_baseboard: true,
+            wall_trim_crown: false,
             trim_height: 0.8,
             trim_depth: 0.25,
             trim_color: [236, 232, 222],

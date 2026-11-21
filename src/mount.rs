@@ -316,11 +316,15 @@ pub struct MaterialFiles {
 }
 
 /// Follows a material (path under `materials/`, no extension) to its VTFs.
-fn resolve_material(m: &dyn Content, mat: &str) -> Option<(String, Option<String>, u8)> {
+/// The error says what exactly is missing (the material, or the texture
+/// file it points at).
+fn resolve_material(m: &dyn Content, mat: &str) -> Result<(String, Option<String>, u8), String> {
     let mat = norm(mat);
     let mut params = std::collections::HashMap::new();
     let mut shader = String::new();
-    if let Some(bytes) = m.read(&format!("materials/{mat}.vmt")) {
+    let vmt = m.read(&format!("materials/{mat}.vmt"));
+    let has_vmt = vmt.is_some();
+    if let Some(bytes) = vmt {
         let v = parse_vmt(&String::from_utf8_lossy(&bytes));
         shader = v.shader.clone();
         params = v.params;
@@ -338,9 +342,16 @@ fn resolve_material(m: &dyn Content, mat: &str) -> Option<(String, Option<String
             }
         }
     }
-    let base = params.get("$basetexture").cloned().unwrap_or_else(|| mat.clone());
+    let named = params.get("$basetexture").cloned();
+    let base = named.clone().unwrap_or_else(|| mat.clone());
     let base_vtf = format!("materials/{}.vtf", norm(&base));
-    m.read(&base_vtf)?;
+    if m.read(&base_vtf).is_none() {
+        return Err(match (has_vmt, named) {
+            (false, _) => format!("{mat}: material not found"),
+            (true, Some(b)) => format!("{mat}: its texture {} isn't installed", norm(&b)),
+            (true, None) => format!("{mat}: the material has no texture ($basetexture), only settings"),
+        });
+    }
     let bump = params.get("$bumpmap").or_else(|| params.get("$normalmap")).map(|b| format!("materials/{}.vtf", norm(b)));
     let on = |k: &str| params.get(k).is_some_and(|v| v.trim() != "0");
     let alpha = if on("$alphatest") {
@@ -350,7 +361,7 @@ fn resolve_material(m: &dyn Content, mat: &str) -> Option<(String, Option<String
     } else {
         0
     };
-    Some((base_vtf, bump, alpha))
+    Ok((base_vtf, bump, alpha))
 }
 
 fn save_vtf_png(m: &dyn Content, vtf_rel: &str, out: &Path) -> Result<(), String> {
@@ -370,14 +381,14 @@ fn save_vtf_png(m: &dyn Content, vtf_rel: &str, out: &Path) -> Result<(), String
 
 /// Decodes a material's base texture for previews.
 pub fn preview_material(m: &dyn Content, mat: &str, max_dim: u32) -> Result<source::Rgba, String> {
-    let (vtf, _, _) = resolve_material(m, mat).ok_or_else(|| format!("{mat}: no base texture found"))?;
+    let (vtf, _, _) = resolve_material(m, mat)?;
     decode_vtf(&m.read(&vtf).ok_or("texture missing")?, max_dim)
 }
 
 /// Converts a material into PNG files under `content/materials/`.
 pub fn import_material(m: &dyn Content, mat: &str) -> Result<MaterialFiles, String> {
     let mat = norm(mat);
-    let (base, bump, alpha) = resolve_material(m, &mat).ok_or_else(|| format!("{mat}: no base texture found"))?;
+    let (base, bump, alpha) = resolve_material(m, &mat)?;
     let translucent = alpha > 0;
     let dir = content_dir();
     let image = dir.join(format!("{}.png", base.trim_end_matches(".vtf")));
@@ -396,6 +407,13 @@ pub fn import_material(m: &dyn Content, mat: &str) -> Result<MaterialFiles, Stri
 /// Converts a model (and its textures) into an OBJ + MTL + PNGs under
 /// `content/models/`. `scale` converts Source units to editor units.
 pub fn import_model(m: &dyn Content, mdl: &str, scale: f32) -> Result<PathBuf, String> {
+    import_model_report(m, mdl, scale).map(|r| r.0)
+}
+
+/// `import_model`, plus why each material that couldn't be converted is
+/// missing (the model is still made; those parts are untextured).
+pub fn import_model_report(m: &dyn Content, mdl: &str, scale: f32) -> Result<(PathBuf, Vec<String>), String> {
+    let mut missing = Vec::new();
     let rel = norm(mdl);
     let model = load_mdl(&|r| m.read(r), &rel)?;
     let dir = content_dir();
@@ -409,7 +427,11 @@ pub fn import_model(m: &dyn Content, mdl: &str, scale: f32) -> Result<PathBuf, S
     for (i, mat) in model.materials.iter().enumerate() {
         let mname = format!("m{i}_{}", mat.rsplit('/').next().unwrap_or("mat").replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_"));
         let _ = writeln!(mtl, "\nnewmtl {mname}\nKd 1 1 1");
-        if let Ok(files) = import_material(m, mat) {
+        let got = import_material(m, mat);
+        if let Err(e) = &got {
+            missing.push(e.clone());
+        }
+        if let Ok(files) = got {
             if let Some(rel) = pathdiff(Path::new(&files.image), &obj_dir) {
                 let _ = writeln!(mtl, "map_Kd {rel}");
                 // the picture's alpha: holes (cut-out) or see-through
@@ -457,7 +479,7 @@ pub fn import_model(m: &dyn Content, mdl: &str, scale: f32) -> Result<PathBuf, S
     }
     std::fs::write(&obj_path, obj).map_err(|e| e.to_string())?;
     std::fs::write(obj_dir.join(format!("{stem}.mtl")), mtl).map_err(|e| e.to_string())?;
-    Ok(obj_path)
+    Ok((obj_path, missing))
 }
 
 /// `target` relative to `base` with forward slashes (both absolute).

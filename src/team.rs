@@ -26,7 +26,8 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const PROTOCOL: u32 = 1;
+/// 2: keep-alive pings, room codes.
+pub const PROTOCOL: u32 = 2;
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_PORT: u16 = 47600;
 pub const HOST_ID: u32 = 1;
@@ -37,6 +38,10 @@ const WELCOME_LIMIT: usize = 512 * 1024 * 1024;
 pub const ASSET_LIMIT: u64 = 24 * 1024 * 1024;
 pub const ASSET_EXTS: [&str; 9] = ["png", "jpg", "jpeg", "bmp", "tga", "obj", "stl", "glb", "gltf"];
 const TICK: Duration = Duration::from_millis(100);
+/// A quiet link sends a ping this often...
+const PING_EVERY: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(10) };
+/// ...and the host gives up on a guest it hasn't heard from for this long.
+const QUIET_LIMIT: Duration = if cfg!(test) { Duration::from_secs(2) } else { Duration::from_secs(90) };
 const MAX_ASKS: usize = 4;
 const MAX_HANDSHAKES: usize = 32;
 
@@ -80,6 +85,9 @@ pub enum Msg {
     },
     AssetMissing { path: String },
     Bye { reason: String },
+    /// Sent when a link has been quiet for a while, so a peer whose window
+    /// is busy (a file dialog open) isn't mistaken for a dead connection.
+    Ping,
 }
 
 enum Event {
@@ -110,6 +118,11 @@ fn random_u64() -> u64 {
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     h.finish()
+}
+
+/// A random number for one room-code search.
+pub fn random_nonce() -> u64 {
+    random_u64()
 }
 
 /// 8-character invite code (about 40 bits), no look-alike characters.
@@ -378,7 +391,8 @@ pub fn validate_object(o: &Object) -> Result<(), String> {
     if !ok_v2(tp.scale) || !ok_v2(tp.offset) || !ok_f(tp.rotation) {
         return bad("texture settings");
     }
-    if o.face_tex.len() > 1_000_000 || o.face_tex.iter().flatten().any(|f| !ok_v2(f.params.scale) || !ok_v2(f.params.offset) || !ok_f(f.params.rotation)) {
+    let bad_axes = |f: &crate::map::FaceTex| f.uv.is_some_and(|a| !ok_v3(a.u) || !ok_v3(a.v));
+    if o.face_tex.len() > 1_000_000 || o.face_tex.iter().flatten().any(|f| !ok_v2(f.params.scale) || !ok_v2(f.params.offset) || !ok_f(f.params.rotation) || bad_axes(f)) {
         return bad("face textures");
     }
     if let Some(t) = &o.text {
@@ -493,7 +507,13 @@ impl Link {
         let _ = w.set_write_timeout(Some(Duration::from_secs(20)));
         let (tx, rx) = mpsc::sync_channel::<Arc<str>>(4096);
         std::thread::spawn(move || {
-            for l in rx {
+            let ping = line(&Msg::Ping);
+            loop {
+                let l = match rx.recv_timeout(PING_EVERY) {
+                    Ok(l) => l,
+                    Err(mpsc::RecvTimeoutError::Timeout) => ping.clone(),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 if w.write_all(l.as_bytes()).is_err() {
                     break;
                 }
@@ -528,18 +548,25 @@ fn read_msg(r: &mut BufReader<TcpStream>, limit: usize, buf: &mut Vec<u8>) -> Re
 fn reader_loop(conn: u32, mut r: BufReader<TcpStream>, limit: usize, tx: Sender<Event>) {
     let mut buf = Vec::new();
     let mut window = Instant::now();
-    let (mut bytes, mut count) = (0usize, 0usize);
+    let (mut bytes, mut files, mut count) = (0usize, 0usize, 0usize);
     loop {
         match read_msg(&mut r, limit, &mut buf) {
             Ok(msg) => {
                 if window.elapsed() > Duration::from_secs(10) {
                     window = Instant::now();
                     bytes = 0;
+                    files = 0;
                     count = 0;
                 }
-                bytes += buf.len();
+                // files someone asked for (after a big import) get their own,
+                // bigger allowance than everything else
+                if matches!(msg, Msg::AssetData { .. }) {
+                    files += buf.len();
+                } else {
+                    bytes += buf.len();
+                }
                 count += 1;
-                if bytes > 400 * 1024 * 1024 || count > 4000 {
+                if bytes > 400 * 1024 * 1024 || files > 3 * 1024 * 1024 * 1024 || count > 4000 {
                     let _ = tx.send(Event::Closed { conn, reason: "was sending far too much data".into() });
                     break;
                 }
@@ -622,11 +649,14 @@ fn handshake(conn: u32, s: TcpStream, addr: SocketAddr, shared: &HostShared, tx:
             *f.entry(addr.ip()).or_insert(0) += 1;
         }
         std::thread::sleep(Duration::from_secs(1));
-        refuse(&s, "Wrong invite code.");
+        refuse(&s, "Wrong room code.");
         return;
     }
     let Ok(stream) = s.try_clone() else { return };
-    let _ = s.set_read_timeout(Some(Duration::from_secs(90)));
+    // the reader has its own copy of the socket: on Windows a copy keeps the
+    // timeout it was made with, so set it there (not only on `s`)
+    let _ = s.set_read_timeout(Some(QUIET_LIMIT));
+    let _ = r.get_ref().set_read_timeout(Some(QUIET_LIMIT));
     if tx.send(Event::Hello { conn, name: clean_name(&name), color, addr, stream }).is_err() {
         return;
     }
@@ -699,6 +729,8 @@ pub struct Session {
     cache_dir: PathBuf,
     last_tick: Option<Instant>,
     last_presence: (Option<Instant>, u64),
+    /// Host: answers room-code searches on the network (None if it couldn't start).
+    pub beacon: Option<crate::room::Beacon>,
 }
 
 impl Session {
@@ -735,6 +767,7 @@ impl Session {
             cache_dir,
             last_tick: None,
             last_presence: (None, 0),
+            beacon: None,
         }
     }
 
@@ -761,6 +794,10 @@ impl Session {
         s.local_paths = map_paths(map);
         s.mark_all_sent(map);
         s.log.push(format!("Hosting on port {port}"));
+        match crate::room::Beacon::start(&s.code, port, &crate::room::PORTS, allow_internet) {
+            Ok(b) => s.beacon = Some(b),
+            Err(e) => s.log.push(format!("Room code search is off ({e}); friends can still join by address")),
+        }
         Ok(s)
     }
 
@@ -874,6 +911,7 @@ impl Session {
         }
         self.links.clear(); // writers flush the goodbye, then close
         self.stop.store(true, Ordering::Relaxed);
+        self.beacon = None;
         self.ended = Some("You left the session.".into());
     }
 
@@ -977,7 +1015,7 @@ impl Session {
 
     fn handle_msg(&mut self, conn: u32, msg: Msg, map: &mut Map, out: &mut Pumped) {
         match msg {
-            Msg::Hello { .. } => {}
+            Msg::Hello { .. } | Msg::Ping => {}
             Msg::Refuse { reason } | Msg::Bye { reason } => {
                 if !self.host && conn == HOST_ID {
                     self.links.clear();

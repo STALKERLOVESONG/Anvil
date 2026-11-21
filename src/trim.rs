@@ -135,8 +135,123 @@ pub fn trim_plan(map: &Map, id: u64, point: Vec3, normal: Vec3, h: f32, d: f32, 
     Ok(vec![t])
 }
 
+/// A wall brush's center line (flat ends) and its thickness, if it's an
+/// upright Box.
+fn wall_line(w: &Object) -> Option<(Vec3, Vec3, f32)> {
+    let Kind::Brush { shape: Shape::Box, size, .. } = w.kind else { return None };
+    if w.rot.x.abs() > 0.01 || w.rot.z.abs() > 0.01 {
+        return None;
+    }
+    let along_x = size.x >= size.z;
+    let (len, t) = if along_x { (size.x, size.z) } else { (size.z, size.x) };
+    let axis = if along_x { Vec3::X } else { Vec3::Z };
+    let flat = |p: Vec3| Vec3::new(p.x, 0.0, p.z);
+    Some((flat(w.to_world(-axis * len * 0.5)), flat(w.to_world(axis * len * 0.5)), t))
+}
+
+/// Which ends of `wall` (start, end of its length axis) another upright
+/// wall in `map` meets.
+pub fn wall_joins(map: &Map, wall: &Object) -> [bool; 2] {
+    let Some((a, b, t)) = wall_line(wall) else { return [false; 2] };
+    let mut out = [false; 2];
+    for o in &map.objects {
+        if o.id == wall.id || o.name.starts_with("Trim") {
+            continue;
+        }
+        let Some((c, d, t2)) = wall_line(o) else { continue };
+        let near = (t.max(t2)) * 0.75 + 1e-3;
+        for (i, e) in [a, b].iter().enumerate() {
+            if (*e - c).length() < near || (*e - d).length() < near {
+                out[i] = true;
+            }
+        }
+    }
+    out
+}
+
+/// Trim strips for a wall drawn with the Wall tool: baseboard and/or crown
+/// on both sides, as long as the wall. At an end where another wall meets
+/// it, the strips run on past the corner so they meet that wall's strips.
+#[allow(clippy::too_many_arguments)]
+pub fn wall_trim_pieces(wall: &Object, joins: [bool; 2], h: f32, d: f32, baseboard: bool, crown: bool, color: [u8; 3]) -> Vec<Object> {
+    let Kind::Brush { shape: Shape::Box, size, .. } = wall.kind else { return Vec::new() };
+    let along = if size.x >= size.z { 0 } else { 2 };
+    let k = 2 - along; // the thickness axis
+    let h = h.min(size.y * 0.45).max(0.01);
+    let ext = |j: bool| if j { size[k] * 0.5 + d } else { 0.0 };
+    let (e0, e1) = (ext(joins[0]), ext(joins[1]));
+    let mut out = Vec::new();
+    for (on, bottom, label) in [(baseboard, -size.y * 0.5, "baseboard"), (crown, size.y * 0.5 - h, "crown")] {
+        if !on {
+            continue;
+        }
+        for side in [1.0f32, -1.0] {
+            let mut c = Vec3::ZERO;
+            c[k] = side * (size[k] * 0.5 + d * 0.5);
+            c[along] = (e1 - e0) * 0.5;
+            c.y = bottom + h * 0.5;
+            let mut s = Vec3::ZERO;
+            s[along] = size[along] + e0 + e1;
+            s.y = h;
+            s[k] = d;
+            let mut t = Object::brush(Shape::Box, s, wall.to_world(c), color, Material::Wood);
+            t.rot = wall.rot;
+            t.folder = wall.folder;
+            t.name = format!("Trim {} {label} {}", wall.name, if side > 0.0 { "A" } else { "B" });
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// The trim pieces the Wall tool made for `wall` (by name).
+pub fn wall_trim_ids(map: &Map, wall: &Object) -> Vec<u64> {
+    let prefix = format!("Trim {} ", wall.name);
+    map.objects.iter().filter(|o| o.name.starts_with(&prefix)).map(|o| o.id).collect()
+}
+
 impl AnvilApp {
-    /// Trim tool click on a wall.
+    /// Wall tool: adds a new wall, with its trim when that's on, and redoes
+    /// the trim of walls it joins so the corners meet. One undo step.
+    pub(crate) fn add_wall_with_trim(&mut self, wall: Object) -> u64 {
+        self.push_undo();
+        let id = self.map.add(wall);
+        let mut sel = vec![id];
+        let s = &self.settings;
+        if s.wall_trim && (s.wall_trim_baseboard || s.wall_trim_crown) {
+            let (h, d, bb, cr, col) = (s.trim_height, s.trim_depth, s.wall_trim_baseboard, s.wall_trim_crown, s.trim_color);
+            let w = self.map.get(id).cloned().unwrap();
+            let joins = wall_joins(&self.map, &w);
+            for p in wall_trim_pieces(&w, joins, h, d, bb, cr, col) {
+                sel.push(self.map.add(p));
+            }
+            // walls it touches that have Wall-tool trim: extend theirs to meet
+            let others: Vec<Object> = self.map.objects.iter().filter(|o| o.id != id && !o.name.starts_with("Trim") && wall_line(o).is_some()).cloned().collect();
+            for o in others {
+                let old = wall_trim_ids(&self.map, &o);
+                if old.is_empty() {
+                    continue;
+                }
+                let j = wall_joins(&self.map, &o);
+                // keep its own kinds of strips (baseboard / crown)
+                let had = |l: &str| self.map.objects.iter().any(|t| old.contains(&t.id) && t.name.contains(l));
+                let (ob, oc) = (had(" baseboard "), had(" crown "));
+                let sample = self.map.objects.iter().find(|t| old.contains(&t.id)).cloned();
+                let Some(sample) = sample else { continue };
+                let (sh, sd) = match sample.kind {
+                    Kind::Brush { size, .. } => (size.y, size.x.min(size.z)),
+                    _ => (h, d),
+                };
+                self.map.remove(&old);
+                for p in wall_trim_pieces(&o, j, sh, sd, ob, oc, sample.color) {
+                    self.map.add(p);
+                }
+            }
+        }
+        self.selection = sel;
+        id
+    }
+
     pub(crate) fn place_trim(&mut self, id: u64, point: Vec3, normal: Vec3, snapping: bool) {
         let s = &self.settings;
         let g = if snapping { self.snap_step() } else { 0.0 };

@@ -159,6 +159,16 @@ The 3D view's header has **Persp / Top / Bottom / Front / Back / Left / Right**.
   - Roblox gets one `Texture` per face, with `Color3` set to the tint.
   - Unity gets one material per texture.
 
+## Wall trim
+
+With the **Wall** tool, tick *Add trim to new walls* in its settings. Pick Baseboard
+and/or Crown, plus their height, depth and color (shared with the Trim tool).
+
+- Each wall you draw gets the strips on both sides.
+- Where walls meet, the strips run on so the corners close.
+- Doors and windows cut through them.
+- The strips are ordinary boxes named `Trim <wall> …`, so you can edit or delete them.
+
 ## Tool settings, trim and themes
 
 - **Tool settings:** the box under the tool list shows the active tool's options.
@@ -187,6 +197,16 @@ sphere where you want it, select the model and then the shape, and pick Subtract
 result is an editable mesh (Tab).
 
 ## Sketchfab (plugin)
+
+- **Which file it downloads:** Sketchfab offers each model as a .glb and as a zipped .gltf.
+  The plugin takes whichever is smaller.
+- **While downloading:** you see progress and a *Cancel* button. Dropped connections are
+  retried twice.
+- **After downloading:** unpacking, parsing and texture decoding happen in the background,
+  so the editor doesn't freeze.
+- **Materials:** both glTF kinds load, metal/roughness and the older
+  specular/glossiness that many Sketchfab models use. A material with only a color shows
+  that color instead of white.
 
 Plugins → **Sketchfab** → *Open window*.
 
@@ -339,15 +359,25 @@ Edit → UV editor, or *Open UV editor* under a texture's settings.
 
 Edit one map together, live, like Roblox Team Create.
 
-- **Host:** Team → Team Create… → *Start hosting*. Give friends your address and the
-  invite code. When someone asks to join, you click **Allow** or **Deny**.
-- **Join:** type the host's address and invite code, then click *Join*. Your open map is
-  replaced with the host's map, so save it first if you want to keep it.
+- **Host:** Team → Team Create… → *Create room*. You get a **room code** (like
+  `ABCD-EF23`, with a Copy button). Send it to your friends. When someone asks to join,
+  you click **Allow** or **Deny**.
+- **Join:** type the room code under *Join a room* and press *Join*. Anvil finds the room
+  and connects. Your open map is replaced with the room's map, so save it first if you
+  want to keep it.
+- **Where room codes work:** on the same home network, or the same VPN: Tailscale,
+  ZeroTier, Radmin VPN or Hamachi. Anvil has no server of its own, so a code can't
+  find a PC across the plain internet. For that, open *Advanced*: the host's address
+  (with a forwarded port and *Let people from the internet in*), plus the room code as
+  the password.
 - **While you work:**
   - Everyone's edits sync about 10 times a second.
   - Other people float in the views as colored balls with their name and tool.
   - Whatever they have selected is outlined in their color.
   - Undo only undoes your own changes.
+- **Importing maps in a room:** host or guest can use *File → Import Source map* while
+  connected. Everyone gets the brushes, props, lights, spawns, folders and textures, and
+  can edit them.
 - **Textures and models:** the files the map uses are copied over automatically, including
   each prop's `.mtl` and texture images (or a glTF / Sketchfab model's `.bin` and textures). So props (Half-Life imports too) show up textured
   for everyone, even if only one of you has the game.
@@ -359,8 +389,11 @@ Edit one map together, live, like Roblox Team Create.
     addresses work) unless you tick *Allow joins from the internet*.
   - With internet joins on, people who connect can see your IP address. Using a VPN mesh
     is safer and keeps real IPs private.
-- **Who can get in:** every join needs the invite code *and* your approval. Wrong codes
+- **Who can get in:** every join needs the room code *and* your approval. Wrong codes
   are slowed down and blocked after 5 tries. Both sides must run the same Anvil version.
+- **Finding a room** never sends the code itself. The joiner asks with a random number
+  and a tag made from the code, and only a host with that code answers. Hosts answer only
+  LAN / VPN addresses, rate-limited.
 - **What peers can send:** only plain data, never code.
   - Everything received is checked first: sizes, numbers and mesh indices. Anyone who
     sends broken data is removed.
@@ -392,6 +425,22 @@ A first-person character at Roblox scale: 2×5 studs, 16 studs/s walk, 50 studs/
 Roblox gravity. It collides with every part that has CanCollide on. Controls: WASD, mouse look,
 Space to jump, Shift to run, Esc to stop. You start on the first Spawn, or under the camera if
 there isn't one.
+
+## Transparency
+
+- **Textures** (walls, meshes, imported maps): select the object, then set *Texture
+  transparency* in the Inspector, or use the Textures window. This changes the texture
+  everywhere it's used.
+- **Props:** select one, then set *Transparency* in the Inspector. This changes the model
+  file, so every copy changes.
+
+Modes:
+- **Solid.**
+- **Cut out:** see-through pixels are holes. For leaves, fences and grates.
+- **See-through:** blended. For glass.
+
+Half-Life materials bring their own setting (`$alphatest`, `$translucent`). A picture
+with alpha but no such setting stays solid.
 
 ## Textures & decals
 
@@ -528,7 +577,10 @@ map, under one folder named after it:
 - **Hidden folders**: clips and invisible walls, and the 3D skybox.
 
 Textures and models come from the map's own packed files first, then from your mounted
-content (see above). The report window lists anything that wasn't found. Mount the game it
+content (see above). The report window lists anything that wasn't found, with what
+exactly is missing (the material, or the texture file it points at) and what uses it.
+Where two brushes overlap with faces in the same plane, the covered part is cut away, as
+Source's compiler does. Otherwise they would flicker through each other. Mount the game it
 comes from (for example Counter-Strike: Source for `cs_*` / `de_*` textures), then import
 again. The whole import is one undo step.
 

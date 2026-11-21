@@ -184,6 +184,10 @@ impl Ctx<'_> {
         for (normal_id, key) in faces {
             let (def, params) = self.face_texture(o, key);
             let Some(t) = def else { continue };
+            // a face with its own texture axes (from a Source map): Roblox
+            // textures can't rotate or shear, so keep the tile size right and
+            // let the offset start at the part's corner
+            let axes = key.and_then(|f| o.face_tex.get(f)).and_then(|f| f.as_ref()).and_then(|f| f.uv);
             if t.roblox_image_id.trim().is_empty() {
                 missing_id = Some(t.name.clone());
                 continue;
@@ -191,10 +195,10 @@ impl Ctx<'_> {
             p.children.push(Child::Texture {
                 face: normal_id,
                 id: asset_url(&t.roblox_image_id),
-                su: t.scale.x * params.scale.x * s,
-                sv: t.scale.y * params.scale.y * s,
-                ou: (t.offset.x + params.offset.x) * s,
-                ov: (t.offset.y + params.offset.y) * s,
+                su: t.scale.x * params.scale.x * s / axes.map(|a| a.u.length().max(1e-4)).unwrap_or(1.0),
+                sv: t.scale.y * params.scale.y * s / axes.map(|a| a.v.length().max(1e-4)).unwrap_or(1.0),
+                ou: if axes.is_some() { 0.0 } else { (t.offset.x + params.offset.x) * s },
+                ov: if axes.is_some() { 0.0 } else { (t.offset.y + params.offset.y) * s },
                 tint: params.tint,
             });
         }

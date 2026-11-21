@@ -8,6 +8,10 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
+/// The file dialog runs on its own thread so the window (and Team Create)
+/// keeps going while someone browses for a map.
+pub(crate) type BspPick = Receiver<Option<PathBuf>>;
+
 pub(crate) struct BspJob {
     rx: Receiver<Result<Imported, String>>,
     progress: Arc<Mutex<String>>,
@@ -22,12 +26,16 @@ pub(crate) struct BspReport {
 
 impl AnvilApp {
     pub(crate) fn import_bsp_dialog(&mut self) {
-        if self.bsp_job.is_some() {
+        if self.bsp_job.is_some() || self.bsp_pick.is_some() {
             self.status = "A map is already being imported".into();
             return;
         }
-        let Some(path) = rfd::FileDialog::new().set_title("Import a Source engine map").add_filter("Source map (Garry's Mod, Half-Life 2)", &["bsp"]).pick_file() else { return };
-        self.import_bsp(path);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let p = rfd::FileDialog::new().set_title("Import a Source engine map").add_filter("Source map (Garry's Mod, Half-Life 2)", &["bsp"]).pick_file();
+            let _ = tx.send(p);
+        });
+        self.bsp_pick = Some(rx);
     }
 
     pub(crate) fn import_bsp(&mut self, path: PathBuf) {
@@ -67,6 +75,18 @@ impl AnvilApp {
     }
 
     pub(crate) fn poll_bsp_import(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.bsp_pick {
+            match rx.try_recv() {
+                Ok(p) => {
+                    self.bsp_pick = None;
+                    if let Some(p) = p {
+                        self.import_bsp(p);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(150)),
+                Err(_) => self.bsp_pick = None,
+            }
+        }
         let Some(job) = &self.bsp_job else { return };
         match job.rx.try_recv() {
             Ok(Ok(imp)) => {
@@ -85,7 +105,11 @@ impl AnvilApp {
                 self.selection = ids.iter().copied().filter(|id| self.map.get(*id).is_some_and(|o| !o.hidden)).collect();
                 self.focus();
                 self.selection.clear();
-                self.status = format!("Imported {name}: {}", report.summary());
+                self.status = if report.missing_materials.is_empty() && report.missing_models.is_empty() {
+                    format!("Imported {name}: {}", report.summary())
+                } else {
+                    format!("Imported {name} with some textures or models missing (see the report): {}", report.summary())
+                };
                 self.bsp_report = Some(BspReport { name, report });
             }
             Ok(Err(e)) => {
@@ -134,7 +158,7 @@ impl AnvilApp {
                 );
                 egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                     for m in &rep.missing_materials {
-                        ui.label(RichText::new(format!("texture  {m}")).monospace().small());
+                        ui.label(RichText::new(m).monospace().small());
                     }
                     for m in &rep.missing_models {
                         ui.label(RichText::new(format!("model    {m}")).monospace().small());

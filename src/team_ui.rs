@@ -16,16 +16,22 @@ pub(crate) struct TeamUi {
     pub join_code: String,
     pub message: String,
     pub pending_seen: usize,
+    /// A room-code search in progress (the code, and where the answer comes).
+    finding: Option<(String, std::sync::mpsc::Receiver<Result<std::net::SocketAddr, String>>)>,
 }
 
 enum Act {
     Host,
     Join,
+    JoinAddr,
     Leave,
     Approve(u32),
     Deny(u32),
     Kick(u32),
 }
+
+/// How many object copies patching the undo history for others' edits may make.
+pub(crate) const HISTORY_COPY_BUDGET: usize = 300_000;
 
 fn c32(c: [u8; 3]) -> Color32 {
     Color32::from_rgb(c[0], c[1], c[2])
@@ -38,6 +44,7 @@ fn pretty_code(c: &str) -> String {
 impl AnvilApp {
     /// Network work for this frame (call once per frame).
     pub(crate) fn poll_team(&mut self, ctx: &egui::Context) {
+        self.poll_room_search(ctx);
         let Some(s) = &mut self.team else { return };
         let tool = match self.tool {
             crate::app::Tool::Plugin(_) => "Plugin".to_string(),
@@ -91,12 +98,44 @@ impl AnvilApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
+    /// A room-code search finished: connect to the host it found.
+    fn poll_room_search(&mut self, ctx: &egui::Context) {
+        let Some((code, rx)) = &self.team_ui.finding else { return };
+        match rx.try_recv() {
+            Ok(Ok(addr)) => {
+                let code = code.clone();
+                self.team_ui.finding = None;
+                match Session::join(&addr.to_string(), &code, &self.settings.team_name, self.settings.team_color, team::default_cache_dir()) {
+                    Ok(s) => self.team = Some(s),
+                    Err(e) => self.team_ui.message = format!("Found the room but couldn't connect to it: {e}"),
+                }
+            }
+            Ok(Err(e)) => {
+                self.team_ui.finding = None;
+                self.team_ui.message = e;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+            Err(_) => self.team_ui.finding = None,
+        }
+    }
+
     /// Someone else's change shouldn't come back when you press undo: put
     /// their version into every undo / redo snapshot too.
     pub(crate) fn patch_history(&mut self, mut changed: Vec<u64>, removed: &[u64], meta: bool) {
         changed.sort_unstable();
         changed.dedup();
         let cur: Vec<Object> = changed.iter().filter_map(|id| self.map.get(*id).cloned()).collect();
+        // a huge change (someone imported a whole map) would be copied into
+        // every undo step; keep only as many recent steps as stay cheap
+        let steps = self.undo.len() + self.redo.len();
+        if cur.len() * steps > HISTORY_COPY_BUDGET {
+            let keep = (HISTORY_COPY_BUDGET / cur.len().max(1)).max(1);
+            if self.undo.len() > keep {
+                let cut = self.undo.len() - keep;
+                self.undo.drain(..cut);
+            }
+            self.redo.truncate(keep.saturating_sub(self.undo.len()));
+        }
         let (name, folders, textures) = (self.map.name.clone(), self.map.folders.clone(), self.map.textures.clone());
         for snap in self.undo.iter_mut().chain(self.redo.iter_mut()) {
             if cur.len() <= 16 {
@@ -226,62 +265,86 @@ impl AnvilApp {
             ui.separator();
             match &self.team {
                 None => {
-                    ui.label(RichText::new("Host").strong());
-                    ui.label(RichText::new("Friends join with your address and the invite code, and you click Allow for each one. Only people on your network or VPN can join unless you allow the internet below.").small().weak());
-                    ui.horizontal(|ui| {
-                        ui.label("Port");
-                        ui.add(egui::DragValue::new(&mut self.settings.team_port).range(1024..=65535));
-                    });
-                    ui.checkbox(&mut self.settings.team_allow_internet, "Allow joins from the internet (not just LAN / VPN)");
-                    if self.settings.team_allow_internet {
-                        ui.label(RichText::new("People who connect can see your public IP address, and you'd need to forward the port on your router. Safer: both install Tailscale or ZeroTier, leave this off, and use the VPN address.").small().color(Color32::from_rgb(255, 170, 60)));
-                    }
-                    if ui.button("Start hosting").clicked() {
+                    ui.label(RichText::new("Create a room").strong());
+                    ui.label(RichText::new("You get a room code to send your friends, and you click Allow for each one who knocks.").small().weak());
+                    if ui.button("Create room").clicked() {
                         act = Some(Act::Host);
                     }
                     ui.add_space(6.0);
                     ui.separator();
-                    ui.label(RichText::new("Join").strong());
-                    egui::Grid::new("team_join").num_columns(2).show(ui, |ui| {
-                        ui.label("Address");
-                        ui.add(egui::TextEdit::singleline(&mut self.settings.team_join_addr).hint_text("192.168.1.20 or 100.x.y.z").desired_width(200.0));
-                        ui.end_row();
-                        ui.label("Invite code");
-                        ui.add(egui::TextEdit::singleline(&mut self.team_ui.join_code).hint_text("ABCD-EF23").desired_width(120.0).char_limit(16));
-                        ui.end_row();
+                    ui.label(RichText::new("Join a room").strong());
+                    let searching = self.team_ui.finding.is_some();
+                    ui.horizontal(|ui| {
+                        ui.label("Room code");
+                        let r = ui.add_enabled(!searching, egui::TextEdit::singleline(&mut self.team_ui.join_code).hint_text("ABCD-EF23").desired_width(110.0).char_limit(16));
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.add_enabled(!searching, egui::Button::new("Join")).clicked() || (enter && !searching) {
+                            act = Some(Act::Join);
+                        }
                     });
+                    if searching {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Looking for the room on your network and VPN...");
+                        });
+                    }
+                    ui.label(RichText::new("Works when you're on the same home network, or the same VPN (Tailscale, ZeroTier, Radmin, Hamachi). For other setups see Advanced.").small().weak());
                     if self.dirty {
-                        ui.label(RichText::new("Joining replaces the open map with the host's. Save first if you want to keep it.").small().color(Color32::from_rgb(255, 170, 60)));
+                        ui.label(RichText::new("Joining replaces the open map with the room's. Save first if you want to keep it.").small().color(Color32::from_rgb(255, 170, 60)));
                     }
-                    if ui.button("Join").clicked() {
-                        act = Some(Act::Join);
-                    }
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new("Advanced (other networks)").default_open(false).show(ui, |ui| {
+                        ui.label(RichText::new("Only if the room code can't find the room: connect straight to the host's address (they see it under Advanced in their room), using the room code above as the password.").small().weak());
+                        ui.horizontal(|ui| {
+                            ui.label("Host address");
+                            ui.add(egui::TextEdit::singleline(&mut self.settings.team_join_addr).hint_text("192.168.1.20").desired_width(150.0));
+                            if ui.button("Join by address").clicked() {
+                                act = Some(Act::JoinAddr);
+                            }
+                        });
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Port when hosting");
+                            ui.add(egui::DragValue::new(&mut self.settings.team_port).range(1024..=65535));
+                        });
+                        ui.checkbox(&mut self.settings.team_allow_internet, "Let people from the internet in (not just LAN / VPN)");
+                        if self.settings.team_allow_internet {
+                            ui.label(RichText::new("They'd need your public address and a forwarded port, and they can see your IP. Safer: both install Tailscale or ZeroTier and leave this off.").small().color(Color32::from_rgb(255, 170, 60)));
+                        }
+                    });
                 }
                 Some(s) => {
                     if s.host {
                         ui.horizontal(|ui| {
-                            ui.label("Invite code");
-                            ui.label(RichText::new(pretty_code(&s.code)).monospace().strong().size(16.0));
-                            if ui.small_button("Copy").clicked() {
+                            ui.label("Room code");
+                            ui.label(RichText::new(pretty_code(&s.code)).monospace().strong().size(18.0));
+                            if ui.button("Copy").clicked() {
                                 ui.ctx().copy_text(pretty_code(&s.code));
                             }
                         });
+                        if s.beacon.is_some() {
+                            ui.label(RichText::new("Send this code to your friends. They type it under Join a room (same network or VPN).").small().weak());
+                        } else {
+                            ui.label(RichText::new("The room code can't be looked up from this PC right now (another program has its ports). Friends can still join with your address under Advanced.").small().color(Color32::from_rgb(255, 170, 60)));
+                        }
                         let addr = team::lan_ip().map(|ip| if s.port == team::DEFAULT_PORT { ip.to_string() } else { format!("{ip}:{}", s.port) });
-                        ui.horizontal(|ui| {
-                            ui.label("Your address");
-                            match &addr {
-                                Some(a) => {
-                                    ui.label(RichText::new(a).monospace());
-                                    if ui.small_button("Copy").clicked() {
-                                        ui.ctx().copy_text(a.clone());
+                        egui::CollapsingHeader::new("Advanced").id_salt("team_host_adv").default_open(false).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Your address");
+                                match &addr {
+                                    Some(a) => {
+                                        ui.label(RichText::new(a).monospace());
+                                        if ui.small_button("Copy").clicked() {
+                                            ui.ctx().copy_text(a.clone());
+                                        }
+                                    }
+                                    None => {
+                                        ui.label(format!("this PC, port {}", s.port));
                                     }
                                 }
-                                None => {
-                                    ui.label(format!("this PC, port {}", s.port));
-                                }
-                            }
+                            });
+                            ui.label(RichText::new(if s.allow_internet { "Internet joins allowed (people can see your IP)." } else { "Only LAN / VPN addresses can connect." }).small().weak());
                         });
-                        ui.label(RichText::new(if s.allow_internet { "Internet joins allowed (people can see your IP)." } else { "Only LAN / VPN addresses can connect. Using Tailscale? Give friends your 100.x address." }).small().weak());
                     } else if s.welcomed {
                         ui.label("Connected to the host. Everyone's edits show up live.");
                     } else {
@@ -357,7 +420,7 @@ impl AnvilApp {
                 self.settings.team_name = team::clean_name(&self.settings.team_name);
                 match Session::host(&mut self.map, &self.settings.team_name, self.settings.team_color, self.settings.team_port, self.settings.team_allow_internet, team::default_cache_dir()) {
                     Ok(s) => {
-                        self.status = format!("Hosting Team Create. Invite code {}", pretty_code(&s.code));
+                        self.status = format!("Team Create room open. Room code {}", pretty_code(&s.code));
                         self.team = Some(s);
                     }
                     Err(e) => self.team_ui.message = e,
@@ -366,6 +429,25 @@ impl AnvilApp {
             }
             Act::Join => {
                 self.settings.team_name = team::clean_name(&self.settings.team_name);
+                let _ = self.settings.save();
+                let Some(code) = crate::room::normalize(&self.team_ui.join_code) else {
+                    self.team_ui.message = "That isn't a room code. Room codes are 8 letters and numbers, like ABCD-EF23.".into();
+                    return;
+                };
+                let (tx, rx) = std::sync::mpsc::channel();
+                let c2 = code.clone();
+                std::thread::spawn(move || {
+                    let targets = crate::room::targets();
+                    let _ = tx.send(crate::room::find(&c2, &targets, &crate::room::PORTS, std::time::Duration::from_secs(4)));
+                });
+                self.team_ui.finding = Some((code, rx));
+            }
+            Act::JoinAddr => {
+                self.settings.team_name = team::clean_name(&self.settings.team_name);
+                if self.team_ui.join_code.trim().is_empty() {
+                    self.team_ui.message = "Type the room code too: it's the password for the room.".into();
+                    return;
+                }
                 match Session::join(&self.settings.team_join_addr, &self.team_ui.join_code, &self.settings.team_name, self.settings.team_color, team::default_cache_dir()) {
                     Ok(s) => self.team = Some(s),
                     Err(e) => self.team_ui.message = e,

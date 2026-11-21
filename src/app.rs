@@ -182,6 +182,10 @@ pub struct AnvilApp {
     pub(crate) dirty: bool,
     pub(crate) settings: Settings,
     pub(crate) models: ModelCache,
+    /// Downloaded models being parsed (and their textures decoded) in the
+    /// background: (model path, the mesh, its decoded textures, size limit)
+    pub(crate) warm_tx: std::sync::mpsc::Sender<crate::plugin_panels::Warmed>,
+    pub(crate) warm_rx: Receiver<crate::plugin_panels::Warmed>,
     pub(crate) textures: TexCache,
     pub(crate) tex_previews: HashMap<String, egui::TextureHandle>,
     pub(crate) selection: Vec<u64>,
@@ -272,6 +276,9 @@ pub struct AnvilApp {
     pub(crate) mounts: Option<Arc<crate::mount::Mounts>>,
     pub(crate) mounts_rx: Option<Receiver<crate::mount::Mounts>>,
     pub(crate) bsp_job: Option<crate::bsp_ui::BspJob>,
+    pub(crate) bsp_pick: Option<crate::bsp_ui::BspPick>,
+    /// Transparency of each prop model's materials (None = can't be set), cached.
+    pub(crate) prop_alpha: std::collections::HashMap<String, Option<u8>>,
     pub(crate) bsp_report: Option<crate::bsp_ui::BspReport>,
     pub(crate) content_search: String,
     pub(crate) content_tab_models: bool,
@@ -479,6 +486,7 @@ fn dist_point_segment(p: Vec3, a: Vec3, b: Vec3) -> (f32, Vec3) {
 
 impl AnvilApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let warm = std::sync::mpsc::channel();
         let settings = Settings::load();
         let restore_offer = crate::autosave::unsaved_work(&crate::autosave::dir(), &settings.recent_files);
         let key = cloud::load_key();
@@ -490,6 +498,8 @@ impl AnvilApp {
             brush_shape: settings.default_shape,
             settings,
             models: ModelCache::default(),
+            warm_tx: warm.0,
+            warm_rx: warm.1,
             textures: TexCache::default(),
             tex_previews: HashMap::new(),
             selection: Vec::new(),
@@ -565,6 +575,8 @@ impl AnvilApp {
             mounts: None,
             mounts_rx: None,
             bsp_job: None,
+            bsp_pick: None,
+            prop_alpha: Default::default(),
             bsp_report: None,
             content_search: String::new(),
             content_tab_models: true,
@@ -1052,7 +1064,7 @@ impl AnvilApp {
         if let Some(mut o) = self.wall_object(a, b, 0.0) {
             o.name = format!("Wall_{}", self.map.next_id + 1);
             o.texture = self.build_wall_texture.filter(|t| self.map.textures.iter().any(|d| d.id == *t));
-            self.add_and_select(o);
+            self.add_wall_with_trim(o);
         }
     }
 
@@ -2298,6 +2310,9 @@ impl AnvilApp {
         let mut snap_now = false;
         let mut hollow = false;
         let mut pick_model = false;
+        let mut set_alpha: Option<(String, u8)> = None;
+        let mut set_tex_alpha: Option<(u64, u8)> = None;
+        let tex_alpha: HashMap<u64, (String, u8)> = self.map.textures.iter().map(|t| (t.id, (t.name.clone(), t.alpha))).collect();
         let mut to_mesh = false;
         let mut edit_mesh = false;
         let mut clear_holes = false;
@@ -2387,6 +2402,24 @@ impl AnvilApp {
                         ui.label("Scale");
                         changed |= vec3_edit(ui, scale, 0.01, Some(0.001));
                         ui.end_row();
+                        let cur = *self.prop_alpha.entry(model.clone()).or_insert_with(|| crate::model_alpha::model_alpha(model));
+                        if let Some(cur) = cur {
+                            ui.label("Transparency");
+                            let mut want = cur;
+                            egui::ComboBox::from_id_salt("prop_alpha")
+                                .selected_text(["Solid", "Cut out", "See-through"][cur.min(2) as usize])
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut want, 0, "Solid");
+                                    ui.selectable_value(&mut want, 1, "Cut out").on_hover_text("The picture's see-through parts are holes: leaves, bushes, fences, grates");
+                                    ui.selectable_value(&mut want, 2, "See-through").on_hover_text("Blended by the picture's alpha: glass, smoke");
+                                })
+                                .response
+                                .on_hover_text("How this model's textures use their transparency. Changes every copy of the model.");
+                            if want != cur {
+                                set_alpha = Some((model.clone(), want));
+                            }
+                            ui.end_row();
+                        }
                         ui.label("Roblox Mesh ID");
                         let hint = lib
                             .iter()
@@ -2447,6 +2480,36 @@ impl AnvilApp {
                         }
                     });
                     ui.end_row();
+                    // how each texture on it uses its picture's transparency
+                    // (the texture's own setting, shared by everything using it)
+                    let mut used: Vec<u64> = o.texture.into_iter().chain(o.face_tex.iter().flatten().filter_map(|f| f.texture)).collect();
+                    used.sort_unstable();
+                    used.dedup();
+                    for (i, tid) in used.iter().take(6).enumerate() {
+                        let Some((name, cur)) = tex_alpha.get(tid) else { continue };
+                        ui.label(if i == 0 { "Texture transparency" } else { "" });
+                        ui.horizontal(|ui| {
+                            let mut want = *cur;
+                            egui::ComboBox::from_id_salt(("insp_tex_alpha", *tid))
+                                .selected_text(["Solid", "Cut out", "See-through"][(*cur).min(2) as usize])
+                                .width(95.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut want, 0, "Solid");
+                                    ui.selectable_value(&mut want, 1, "Cut out").on_hover_text("The picture's see-through parts are holes: fences, grates, leaves");
+                                    ui.selectable_value(&mut want, 2, "See-through").on_hover_text("Blended by the picture's alpha: glass, water");
+                                });
+                            ui.label(RichText::new(name).small().weak()).on_hover_text("This is the texture's setting: everything using it changes");
+                            if want != *cur {
+                                set_tex_alpha = Some((*tid, want));
+                            }
+                        });
+                        ui.end_row();
+                    }
+                    if used.len() > 6 {
+                        ui.label("");
+                        ui.label(RichText::new(format!("+{} more textures (Textures window)", used.len() - 6)).small().weak());
+                        ui.end_row();
+                    }
                 }
                 ui.label("Transparency");
                 changed |= ui.add(egui::Slider::new(&mut o.transparency, 0.0..=1.0)).changed();
@@ -2539,6 +2602,26 @@ impl AnvilApp {
                 if let Some(o) = self.map.get_mut(sid) {
                     o.pos = Vec3::new(snap(o.pos.x, g * 0.5), snap(o.pos.y, g * 0.5), snap(o.pos.z, g * 0.5));
                 }
+            }
+        }
+        if let Some((tid, mode)) = set_tex_alpha {
+            self.push_undo();
+            if let Some(t) = self.map.textures.iter_mut().find(|t| t.id == tid) {
+                t.alpha = mode;
+                self.status = format!("Texture '{}' is now {}", t.name, ["solid", "cut out", "see-through"][mode.min(2) as usize]);
+            }
+            self.scene_cache.clear();
+        }
+        if let Some((model, mode)) = set_alpha {
+            match crate::model_alpha::set_model_alpha(&model, mode) {
+                Ok(n) => {
+                    self.models.forget(&model);
+                    self.forget_thumb(&model);
+                    self.scene_cache.clear();
+                    self.prop_alpha.remove(&model);
+                    self.status = format!("{} is now {} ({n} material(s), every copy)", file_name(&model), ["solid", "cut out", "see-through"][mode.min(2) as usize]);
+                }
+                Err(e) => self.status = format!("Couldn't change it: {e}"),
             }
         }
         if pick_model {
@@ -4107,6 +4190,7 @@ impl eframe::App for AnvilApp {
         self.poll_cloud(ctx);
         self.poll_mounts(ctx);
         self.poll_bsp_import(ctx);
+        self.poll_warmed(ctx);
         self.poll_team(ctx);
         self.poll_live();
         self.poll_blend(ctx);

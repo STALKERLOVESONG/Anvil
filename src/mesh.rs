@@ -434,6 +434,19 @@ impl ModelCache {
     /// Puts an in-memory mesh under a made-up path.
     pub fn insert(&mut self, path: &str, m: TriMesh) {
         self.items.insert(path.to_string(), Ok(Arc::new(m)));
+        self.lods.remove(path);
+    }
+
+    /// The model is being loaded elsewhere: show the placeholder until
+    /// `insert` (or `set_failed`) arrives, instead of loading it here.
+    pub fn set_pending(&mut self, path: &str) {
+        self.items.insert(path.to_string(), Err("Getting this model ready…".into()));
+        self.lods.remove(path);
+    }
+
+    pub fn set_failed(&mut self, path: &str, e: String) {
+        self.items.insert(path.to_string(), Err(e));
+        self.lods.remove(path);
     }
 
     pub fn peek(&self, path: &str) -> Option<&Result<Arc<TriMesh>, String>> {

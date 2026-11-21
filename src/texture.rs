@@ -164,6 +164,19 @@ impl TexCache {
         self.version += 1;
     }
 
+    pub fn max_dim(&self) -> u32 {
+        self.max_dim
+    }
+
+    /// Stores a picture decoded elsewhere (on a background thread) at the
+    /// size limit it was made for; ignored if the limit changed since.
+    pub fn put(&mut self, path: &str, img: Option<Arc<TexImage>>, max_dim: u32) {
+        if max_dim == self.max_dim && !self.alias.contains_key(path) {
+            self.items.insert(path.to_string(), img);
+            self.version += 1;
+        }
+    }
+
     /// Changes the preview resolution limit (reloads everything when it changes).
     pub fn set_max_dim(&mut self, max_dim: u32) {
         let max_dim = max_dim.clamp(64, 4096);

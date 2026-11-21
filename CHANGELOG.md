@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.4.0
+
+### Team Create
+- **Room codes.** *Create room* gives you one code, like `ABCD-EF23`. Friends type it under
+  *Join a room* and press Join; nobody types an IP address. You still click Allow for each
+  person.
+  - The code finds the room on your home network and on VPNs: Tailscale, ZeroTier,
+    Radmin and Hamachi.
+  - There is no Anvil server, so a code can't reach a PC across the plain internet. For
+    that, *Advanced* still has join-by-address (with a forwarded port).
+  - Older Anvil versions can't join 0.4.0 rooms; both sides get a clear version message.
+- **Importing a map while in a room works.** Before, a file dialog open for over 10 seconds
+  dropped you from the room. The host was dropping guests after just 10 seconds of
+  silence, not the 90 it was meant to.
+  - Connections now send a keep-alive ping in the background.
+  - The *Import Source map* file picker no longer freezes the window.
+  - Host or guest can import. Everyone gets every brush, prop, light, spawn, folder and
+    texture, can edit it, and stays connected.
+  - Texture and model downloads after a big import no longer trip the flood limit.
+- Undo history stays light when someone else imports a whole map (it no longer copies
+  thousands of objects into every undo step).
+
+### Source map (.bsp) import
+- **Fixed textures that looked like a mess.** Overlapping brushes left two visible faces
+  in the same spot, and they flickered and striped into each other. Where faces overlap
+  in a plane, the covered part is now cut away, like Source's own compiler does. The test
+  map had 87 such pairs; now it has none.
+- Each face's Hammer alignment is now checked against Source's formula at every triangle
+  corner: rotated, scaled, mirrored and offset textures, non-square textures, far-negative
+  coordinates and slanted faces. The UV editor shows exactly what the 3D view draws.
+- **Missing content is named.** The report says what's missing and what uses it: the
+  material, or the texture file it points at. For example: `de_cbble/grassdirt: its texture
+  de_cbble/grassfloor01 isn't installed (used by 40 brush faces, prop tree_small x2)`.
+  The status says when an import had missing textures.
+- Roblox exports of imported faces keep the right tile size (Roblox textures can't rotate
+  or shear, so offsets start at the part's corner).
+
+### Transparency
+- **Inspector: Transparency for props.** Solid, Cut out (leaves, fences, grates) or
+  See-through (glass), for the whole model. Use it for props imported before transparency
+  existed, or whose material didn't say.
+- **Inspector: Texture transparency** for walls and meshes, using the texture's own setting
+  (the same one as in the Textures window).
+- Half-Life materials with `$alphatest` / `$translucent` keep it on imported map brushes and
+  props. A picture with alpha but no such setting stays solid; Anvil doesn't guess.
+
+### Wall tool
+- **Automatic trim.** *Add trim to new walls* in the Wall tool settings adds a baseboard
+  and/or crown to both sides of each wall you draw.
+  - It uses the Trim settings' size and color.
+  - Where walls meet, the strips run on so the corners close.
+  - Doors and windows cut through it like building trim.
+  - The wall and its trim are one undo step, and the settings are saved.
+
+### Sketchfab
+- **Models no longer come in white.** Many Sketchfab models use the older
+  specular/glossiness material, or plain colors with no picture; both were ignored.
+  - Their textures and colors load now.
+  - A texture's color tint is applied too.
+- **Faster downloads:**
+  - Sketchfab offers a .glb and a zipped .gltf of each model, and the plugin now takes the
+    smaller one. On tested models that was 4 MB instead of 30, and 18 MB instead of 48.
+  - It remembers which kind of token works, so there's no failed request before every
+    download.
+  - Connections are reused instead of a new secure connection per request.
+  - Unzipping happens in the background.
+  - The model is parsed and its textures decoded in the background before you place it, so
+    placing it doesn't freeze the editor.
+- Downloads show progress and have a **Cancel** button. A dropped connection or a busy
+  server is retried twice. A cancelled or failed download never leaves a partial file.
+
+### TRP playtest export
+- The player now starts facing the way the spawn pad faces. It used to face the mirror
+  direction.
+- Every spawn pad is exported as a start (`start anvil`, `start anvil 2`, …).
+- A map with no spawn starts on top of whatever is under its middle.
+
 ## 0.3.0
 
 - **Import Source maps (.bsp).** Use *File → Import Source map (.bsp)…* for Garry's Mod and

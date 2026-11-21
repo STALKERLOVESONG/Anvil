@@ -233,19 +233,21 @@ impl Bsp {
             let (a, c, d) = (i32_(b, o), i32_(b, o + 4), i32_(b, o + 8));
             // Left 4 Dead 2 stores (version, offset, length)
             let ok = |ofs: i32, len: i32| ofs >= 0 && len >= 0 && (ofs as u64 + len as u64) <= b.len() as u64;
-            let (ofs, len, ver) = if ok(a, c) { (a, c, d) } else if ok(c, d) { (c, d, a) } else { (0, 0, 0) };
+            let (ofs, len, ver) = if ok(a, c) {
+                (a, c, d)
+            } else if ok(c, d) {
+                (c, d, a)
+            } else {
+                (0, 0, 0)
+            };
             lumps.push((ofs as usize, len as usize, ver));
         }
         let l = |i: usize| lump_slice(b, &lumps, i);
         let mut warnings = Vec::new();
 
         let planes = records(l(1)?, 20, |r| (vec_(r, 0), f32_(r, 12) as f64));
-        let texinfo = records(l(6)?, 72, |r| TexInfo {
-            s: [f32_(r, 0), f32_(r, 4), f32_(r, 8), f32_(r, 12)],
-            t: [f32_(r, 16), f32_(r, 20), f32_(r, 24), f32_(r, 28)],
-            flags: i32_(r, 64),
-            texdata: i32_(r, 68),
-        });
+        let texinfo =
+            records(l(6)?, 72, |r| TexInfo { s: [f32_(r, 0), f32_(r, 4), f32_(r, 8), f32_(r, 12)], t: [f32_(r, 16), f32_(r, 20), f32_(r, 24), f32_(r, 28)], flags: i32_(r, 64), texdata: i32_(r, 68) });
         let strdata = l(43)?;
         let strtab: Vec<i32> = records(l(44)?, 4, |r| i32_(r, 0));
         let texdata = records(l(2)?, 32, |r| {
@@ -259,14 +261,7 @@ impl Bsp {
         let verts = records(l(3)?, 12, |r| vec_(r, 0));
         let edges = records(l(12)?, 4, |r| [u16_(r, 0), u16_(r, 2)]);
         let surfedges = records(l(13)?, 4, |r| i32_(r, 0));
-        let faces = records(l(7)?, 56, |r| Face {
-            plane: u16_(r, 0),
-            side: r[2],
-            first_edge: i32_(r, 4),
-            num_edges: i16_(r, 8),
-            texinfo: i16_(r, 10),
-            dispinfo: i16_(r, 12),
-        });
+        let faces = records(l(7)?, 56, |r| Face { plane: u16_(r, 0), side: r[2], first_edge: i32_(r, 4), num_edges: i16_(r, 8), texinfo: i16_(r, 10), dispinfo: i16_(r, 12) });
         let brushes = records(l(18)?, 12, |r| Brush { first_side: i32_(r, 0), num_sides: i32_(r, 4), contents: i32_(r, 8) });
         let sides = records(l(19)?, 8, |r| BrushSide { plane: u16_(r, 0), texinfo: i16_(r, 2), dispinfo: i16_(r, 4), bevel: r[6] != 0 });
         let models = records(l(14)?, 48, |r| Model { origin: vec_(r, 24), headnode: i32_(r, 36), first_face: i32_(r, 40), num_faces: i32_(r, 44) });
@@ -317,28 +312,7 @@ impl Bsp {
             }
         }
 
-        Ok(Bsp {
-            version,
-            planes,
-            texinfo,
-            texdata,
-            verts,
-            edges,
-            surfedges,
-            faces,
-            brushes,
-            sides,
-            models,
-            nodes,
-            leafs,
-            leafbrushes,
-            dispinfo,
-            dispverts,
-            entities,
-            static_props,
-            pak,
-            warnings,
-        })
+        Ok(Bsp { version, planes, texinfo, texdata, verts, edges, surfedges, faces, brushes, sides, models, nodes, leafs, leafbrushes, dispinfo, dispverts, entities, static_props, pak, warnings })
     }
 
     pub fn open(path: &Path) -> Result<Bsp, String> {
@@ -558,6 +532,50 @@ pub fn brush_polys(planes: &[(DVec3, f64)]) -> Vec<Option<Vec<DVec3>>> {
         .collect()
 }
 
+fn poly_area(p: &[DVec3]) -> f64 {
+    let mut a = DVec3::ZERO;
+    for k in 1..p.len().saturating_sub(1) {
+        a += (p[k] - p[0]).cross(p[k + 1] - p[0]);
+    }
+    a.length() * 0.5
+}
+
+/// `p` minus the convex polygon `g`, both lying on one plane with normal
+/// `n`: the pieces of `p` that `g` doesn't cover.
+pub fn subtract_coplanar(p: &[DVec3], g: &[DVec3], n: DVec3) -> Vec<Vec<DVec3>> {
+    let m = g.len();
+    if m < 3 {
+        return vec![p.to_vec()];
+    }
+    // g's winding decides which side of each edge is "outside"
+    let mut wn = DVec3::ZERO;
+    for k in 0..m {
+        wn += g[k].cross(g[(k + 1) % m]);
+    }
+    let flip = if wn.dot(n) < 0.0 { -1.0 } else { 1.0 };
+    let mut out = Vec::new();
+    let mut rest = p.to_vec();
+    for e in 0..m {
+        let (a, b) = (g[e], g[(e + 1) % m]);
+        let en = (b - a).cross(n) * flip;
+        let len = en.length();
+        if len < 1e-9 {
+            continue;
+        }
+        let en = en / len;
+        let d = en.dot(a);
+        let outside = clip(&rest, -en, -d);
+        if outside.len() >= 3 && poly_area(&outside) > 0.05 {
+            out.push(outside);
+        }
+        rest = clip(&rest, en, d);
+        if rest.len() < 3 || poly_area(&rest) <= 0.05 {
+            return out; // nothing of p is under g any more
+        }
+    }
+    out // what's left in `rest` is covered by g
+}
+
 /// Source (Z up, X forward, Y left) -> Anvil (Y up) in studs.
 fn to_anvil(p: DVec3, k: f64) -> DVec3 {
     DVec3::new(p.x, p.z, -p.y) * k
@@ -614,9 +632,19 @@ pub struct Report {
     pub hidden: usize,
     pub skybox: usize,
     pub textures: usize,
+    /// One line per material that couldn't be used: what exactly is missing
+    /// (the material, or the texture file it names) and what uses it.
     pub missing_materials: Vec<String>,
     pub missing_models: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// A material that couldn't be used, and what in the map wanted it.
+#[derive(Default)]
+struct Missing {
+    reason: String,
+    /// "brush faces" / "terrain" / "prop tree_small" -> how many
+    users: std::collections::BTreeMap<String, usize>,
 }
 
 impl Report {
@@ -665,6 +693,20 @@ struct Ctx<'a> {
     progress: &'a dyn Fn(String),
     /// (plane normal, plane distance, centre) of every displacement face
     disp_faces: Vec<(DVec3, f64, DVec3)>,
+    /// material -> why it's missing and what uses it
+    missing: std::collections::BTreeMap<String, Missing>,
+    /// what the faces being built now are ("brush faces", "terrain")
+    user: &'static str,
+    /// world brushes' drawn faces by plane: where two lie on one plane facing
+    /// the same way, the earlier brush's face loses the covered part (as the
+    /// map compiler does), so they don't flicker through each other
+    coplanar: HashMap<(i64, i64, i64, i64), Vec<(usize, DVec3, f64, Vec<DVec3>)>>,
+}
+
+/// Bucket of a plane for finding coplanar faces (the same plane can be
+/// stored more than once in a map, so match by geometry, not by index).
+fn plane_key(n: DVec3, d: f64) -> (i64, i64, i64, i64) {
+    ((n.x * 100.0).round() as i64, (n.y * 100.0).round() as i64, (n.z * 100.0).round() as i64, (d / 4.0).round() as i64)
 }
 
 impl Ctx<'_> {
@@ -687,8 +729,8 @@ impl Ctx<'_> {
                 }
                 Some(self.textures.len() - 1)
             }
-            Err(_) => {
-                self.report.missing_materials.push(name.clone());
+            Err(e) => {
+                self.missing.entry(name.clone()).or_default().reason = e;
                 None
             }
         };
@@ -696,23 +738,31 @@ impl Ctx<'_> {
         r
     }
 
+    fn note_missing_use(&mut self, material: &str, user: &str) {
+        if let Some(m) = self.missing.get_mut(material) {
+            *m.users.entry(user.to_string()).or_insert(0) += 1;
+        }
+    }
+
     /// The face texture of a Source face whose object sits at `pos` (studs).
     fn face_tex(&mut self, texinfo: i16, pos: DVec3) -> Option<FaceTex> {
-        let tex = self.texture_for(texinfo)?;
+        let Some(tex) = self.texture_for(texinfo) else {
+            if let Some((_, td)) = self.bsp.material(texinfo) {
+                let (name, user) = (norm(&td.name), self.user);
+                self.note_missing_use(&name, user);
+            }
+            return None;
+        };
         let (ti, _) = self.bsp.material(texinfo)?;
         let k = self.k;
         let axis = |a: [f32; 4]| {
             let s = DVec3::new(a[0] as f64, a[2] as f64, -(a[1] as f64)); // Source -> Anvil axes
-            // u_texels = p_src . s + w  ->  in tile units of 0.25 texels per Source unit
+                                                                          // u_texels = p_src . s + w  ->  in tile units of 0.25 texels per Source unit
             ((s * 0.25).as_vec3(), ((pos.dot(s) / k + a[3] as f64) * 0.25 * k) as f32)
         };
         let (u, ou) = axis(ti.s);
         let (v, ov) = axis(ti.t);
-        Some(FaceTex {
-            texture: Some(tex as u64),
-            params: TexParams { offset: Vec2::new(ou, ov), ..TexParams::default() },
-            uv: Some(UvAxes { u, v }),
-        })
+        Some(FaceTex { texture: Some(tex as u64), params: TexParams { offset: Vec2::new(ou, ov), ..TexParams::default() }, uv: Some(UvAxes { u, v }) })
     }
 
     /// A mesh object from polygons in Source units (each with its texinfo).
@@ -763,7 +813,7 @@ impl Ctx<'_> {
         Some(o)
     }
 
-    fn brush_object(&mut self, bi: usize, offset: DVec3) -> Option<(Object, bool)> {
+    fn brush_object(&mut self, bi: usize, offset: DVec3, world: bool) -> Option<(Object, bool)> {
         let bsp = self.bsp;
         let b = bsp.brushes[bi];
         if b.contents & CONTENTS_ORIGIN != 0 {
@@ -774,9 +824,7 @@ impl Ctx<'_> {
         let planes: Vec<(DVec3, f64)> = sides.iter().map(|s| bsp.planes.get(s.plane as usize).copied().unwrap_or((DVec3::ZERO, 0.0))).collect();
         // a displacement's brush: the terrain mesh replaces it. (The side's
         // own dispinfo field isn't reliable: compilers leave 0 in it.)
-        let is_disp = self.disp_faces.iter().any(|(n, d, c)| {
-            planes.iter().any(|(pn, pd)| pn.dot(*n) > 0.999 && (pd - d).abs() < 0.5) && planes.iter().all(|(pn, pd)| pn.dot(*c) - pd <= 0.5)
-        });
+        let is_disp = self.disp_faces.iter().any(|(n, d, c)| planes.iter().any(|(pn, pd)| pn.dot(*n) > 0.999 && (pd - d).abs() < 0.5) && planes.iter().all(|(pn, pd)| pn.dot(*c) - pd <= 0.5));
         if is_disp {
             return None;
         }
@@ -790,7 +838,20 @@ impl Ctx<'_> {
                 all_sky = false;
             }
             if bsp.visible(s.texinfo) {
-                shown.push((p.clone(), s.texinfo));
+                let mut pieces = vec![p.clone()];
+                if world {
+                    let (n, d) = bsp.planes.get(s.plane as usize).copied().unwrap_or((DVec3::Z, 0.0));
+                    let k = plane_key(n, d);
+                    // neighbouring buckets too, in case rounding split them
+                    for dd in [-1i64, 0, 1] {
+                        for (bj, gn, gd, g) in self.coplanar.get(&(k.0, k.1, k.2, k.3 + dd)).map(|v| v.as_slice()).unwrap_or(&[]) {
+                            if *bj > bi && gn.dot(n) > 0.9999 && (gd - d).abs() < 0.05 {
+                                pieces = pieces.iter().flat_map(|q| subtract_coplanar(q, g, n)).collect();
+                            }
+                        }
+                    }
+                }
+                shown.extend(pieces.into_iter().map(|q| (q, s.texinfo)));
             }
             all.push((p, -1i16));
         }
@@ -906,17 +967,36 @@ pub fn import_parsed(bsp: &Bsp, name: &str, content: &dyn Content, opts: &Option
             (!poly.is_empty()).then(|| (n, dist, poly.iter().copied().sum::<DVec3>() / poly.len() as f64))
         })
         .collect();
-    let mut cx = Ctx { bsp, content, k, mats: HashMap::new(), textures: Vec::new(), report: Report::default(), progress, disp_faces };
+    let mut cx = Ctx {
+        bsp,
+        content,
+        k,
+        mats: HashMap::new(),
+        textures: Vec::new(),
+        report: Report::default(),
+        progress,
+        disp_faces,
+        missing: Default::default(),
+        user: "brush faces",
+        coplanar: HashMap::new(),
+    };
+    for bi in bsp.model_brushes(0) {
+        let b = bsp.brushes[bi];
+        let first = b.first_side.max(0) as usize;
+        let sides: Vec<BrushSide> = (first..first + b.num_sides.clamp(0, 4096) as usize).filter_map(|i| bsp.sides.get(i).copied()).filter(|s| !s.bevel).collect();
+        let planes: Vec<(DVec3, f64)> = sides.iter().map(|s| bsp.planes.get(s.plane as usize).copied().unwrap_or((DVec3::ZERO, 0.0))).collect();
+        for (s, p) in sides.iter().zip(brush_polys(&planes)) {
+            if let Some(p) = p.filter(|_| bsp.visible(s.texinfo)) {
+                let (n, d) = bsp.planes.get(s.plane as usize).copied().unwrap_or((DVec3::Z, 0.0));
+                cx.coplanar.entry(plane_key(n, d)).or_default().push((bi, n, d, p));
+            }
+        }
+    }
     cx.report.warnings = bsp.warnings.clone();
     let mut objects: Vec<(Object, Group)> = Vec::new();
 
     // the 3D skybox: everything in the sky_camera's area is hidden
-    let sky_area = bsp
-        .entities
-        .iter()
-        .find(|e| e.get("classname").map(|c| c.as_str()) == Some("sky_camera"))
-        .and_then(|e| num3(e.get("origin")))
-        .and_then(|p| bsp.area_at(p));
+    let sky_area = bsp.entities.iter().find(|e| e.get("classname").map(|c| c.as_str()) == Some("sky_camera")).and_then(|e| num3(e.get("origin"))).and_then(|p| bsp.area_at(p));
     let in_sky = |p: DVec3| sky_area.is_some() && bsp.area_at(p) == sky_area;
 
     // world brushes
@@ -924,7 +1004,7 @@ pub fn import_parsed(bsp: &Bsp, name: &str, content: &dyn Content, opts: &Option
     let mut used = vec![false; bsp.brushes.len()];
     for bi in bsp.model_brushes(0) {
         used[bi] = true;
-        let Some((mut o, hidden)) = cx.brush_object(bi, DVec3::ZERO) else { continue };
+        let Some((mut o, hidden)) = cx.brush_object(bi, DVec3::ZERO, true) else { continue };
         let first_tex = o.face_tex.iter().flatten().filter_map(|f| f.texture).next();
         let label = first_tex.and_then(|t| cx.textures.get(t as usize)).map(|t| short_name(&t.name)).unwrap_or_else(|| "brush".into());
         o.name = format!("{label} {bi}");
@@ -952,28 +1032,40 @@ pub fn import_parsed(bsp: &Bsp, name: &str, content: &dyn Content, opts: &Option
     if !bsp.dispinfo.is_empty() {
         progress("Building terrain…".into());
     }
+    cx.user = "terrain faces";
     for di in 0..bsp.dispinfo.len() {
         if let Some(o) = cx.displacement(di) {
             objects.push((o, Group::Terrain));
         }
     }
+    cx.user = "brush faces";
 
     // entities
     progress("Placing entities…".into());
-    let mut models: HashMap<String, Result<String, String>> = HashMap::new();
+    // model -> (converted file, materials it's missing)
+    let mut models: HashMap<String, Result<(String, Vec<(String, String)>), String>> = HashMap::new();
     let mut prop = |cx: &mut Ctx, mdl: &str, origin: DVec3, angles: DVec3, scale: f32, solid: bool, label: &str| -> Option<Object> {
         let key = norm(mdl);
         if !key.ends_with(".mdl") {
             return None;
         }
         let r = models.entry(key.clone()).or_insert_with(|| {
-            let r = mount::import_model(cx.content, &key, k as f32).map(|p| p.to_string_lossy().to_string());
+            let r = mount::import_model_report(cx.content, &key, k as f32).map(|(p, missing)| {
+                // "material: reason" -> (material, reason)
+                let missing = missing.into_iter().map(|e| (e.split_once(": ").map(|x| x.0.to_string()).unwrap_or_default(), e)).collect();
+                (p.to_string_lossy().to_string(), missing)
+            });
             if let Err(e) = &r {
                 cx.report.missing_models.push(if e.ends_with("not found") { key.clone() } else { format!("{key} ({e})") });
             }
             r
         });
-        let Ok(path) = r.clone() else { return None };
+        let Ok((path, missing)) = r.clone() else { return None };
+        let user = format!("prop {}", short_name(&key).trim_end_matches(".mdl"));
+        for (mat, reason) in missing {
+            cx.missing.entry(mat.clone()).or_default().reason = reason;
+            cx.note_missing_use(&mat, &user);
+        }
         let mut o = Object::new(Kind::Prop { model: path, scale: Vec3::splat(scale), roblox_mesh_id: String::new() }, to_anvil(origin, k).as_vec3(), [255, 255, 255], Material::Plastic);
         o.set_rotation(source_rotation(angles));
         o.collide = solid;
@@ -1015,7 +1107,7 @@ pub fn import_parsed(bsp: &Bsp, name: &str, content: &dyn Content, opts: &Option
             let mut made = false;
             for bi in &brushes {
                 used[*bi] = true;
-                let Some((mut o, hidden)) = cx.brush_object(*bi, offset) else { continue };
+                let Some((mut o, hidden)) = cx.brush_object(*bi, offset, false) else { continue };
                 o.name = format!("{label} {bi}");
                 if class == "func_illusionary" {
                     o.collide = false;
@@ -1066,7 +1158,12 @@ pub fn import_parsed(bsp: &Bsp, name: &str, content: &dyn Content, opts: &Option
                 let b = v.get(3).copied().filter(|b| *b > 0.0).unwrap_or(200.0);
                 let num = |key: &str| e.get(key).and_then(|s| s.trim().parse::<f64>().ok()).filter(|x| x.is_finite() && *x > 0.0);
                 let reach = num("_zero_percent_distance").or_else(|| num("_fifty_percent_distance").map(|x| x * 2.0)).or_else(|| num("distance")).unwrap_or(b.sqrt() * 28.0);
-                let mut o = Object::new(Kind::Light { range: (reach * k).clamp(1.0, 4000.0) as f32, brightness: (2.0 * (b / 200.0).sqrt()).clamp(0.3, 6.0) as f32 }, to_anvil(origin, k).as_vec3(), rgb, Material::Neon);
+                let mut o = Object::new(
+                    Kind::Light { range: (reach * k).clamp(1.0, 4000.0) as f32, brightness: (2.0 * (b / 200.0).sqrt()).clamp(0.3, 6.0) as f32 },
+                    to_anvil(origin, k).as_vec3(),
+                    rgb,
+                    Material::Neon,
+                );
                 o.collide = false;
                 o.name = label;
                 cx.report.lights += 1;
@@ -1077,7 +1174,16 @@ pub fn import_parsed(bsp: &Bsp, name: &str, content: &dyn Content, opts: &Option
                     objects.push((o, Group::Lights));
                 }
             }
-            "info_player_start" | "info_player_deathmatch" | "info_player_combine" | "info_player_rebel" | "info_player_terrorist" | "info_player_counterterrorist" | "info_player_teamspawn" | "info_player_allies" | "info_player_axis" | "gmod_player_start" => {
+            "info_player_start"
+            | "info_player_deathmatch"
+            | "info_player_combine"
+            | "info_player_rebel"
+            | "info_player_terrorist"
+            | "info_player_counterterrorist"
+            | "info_player_teamspawn"
+            | "info_player_allies"
+            | "info_player_axis"
+            | "gmod_player_start" => {
                 let mut pos = to_anvil(origin, k).as_vec3();
                 pos.y += opts.spawn_size.y * 0.5;
                 let mut o = Object::new(Kind::Spawn { size: opts.spawn_size }, pos, [90, 200, 110], Material::SmoothPlastic);
@@ -1103,7 +1209,29 @@ pub fn import_parsed(bsp: &Bsp, name: &str, content: &dyn Content, opts: &Option
         }
     }
     cx.report.textures = cx.textures.len();
-    cx.report.missing_materials.sort();
+    // what's missing, and what it leaves untextured
+    for (mat, m) in &cx.missing {
+        if m.users.is_empty() {
+            continue; // only tool / hidden faces wanted it
+        }
+        let users: Vec<String> = m
+            .users
+            .iter()
+            .map(|(u, n)| {
+                if u.starts_with("prop ") {
+                    if *n > 1 {
+                        format!("{u} x{n}")
+                    } else {
+                        u.clone()
+                    }
+                } else {
+                    format!("{n} {u}")
+                }
+            })
+            .collect();
+        let reason = if m.reason.is_empty() { format!("{mat}: not found") } else { m.reason.clone() };
+        cx.report.missing_materials.push(format!("{reason} (used by {})", users.join(", ")));
+    }
     cx.report.missing_models.sort();
     progress(format!("Done: {}", cx.report.summary()));
     Ok(Imported { name: name.to_string(), objects, textures: cx.textures, report: cx.report })

@@ -191,6 +191,59 @@ fn save_embedded(bytes: &[u8], model: &str, idx: u64, cache: &Path) -> String {
     p.to_string_lossy().to_string()
 }
 
+/// A material's picture: the metal/rough `baseColorTexture`, or the
+/// `diffuseTexture` of the older specular/glossiness kind (many Sketchfab
+/// models use that one).
+fn base_texture(mat: &Value) -> Option<u64> {
+    mat["pbrMetallicRoughness"]["baseColorTexture"]["index"].as_u64().or_else(|| mat["extensions"]["KHR_materials_pbrSpecularGlossiness"]["diffuseTexture"]["index"].as_u64())
+}
+
+/// A material's color (linear RGBA), if it sets one.
+fn base_color(mat: &Value) -> Option<[f32; 4]> {
+    let f = mat["pbrMetallicRoughness"]["baseColorFactor"].as_array().or_else(|| mat["extensions"]["KHR_materials_pbrSpecularGlossiness"]["diffuseFactor"].as_array())?;
+    if f.len() != 4 {
+        return None;
+    }
+    let c: Vec<f32> = f.iter().map(|x| (x.as_f64().unwrap_or(1.0) as f32).clamp(0.0, 1.0)).collect();
+    Some([c[0], c[1], c[2], c[3]])
+}
+
+fn to_srgb(c: f32) -> u8 {
+    let s = if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    (s * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// A small picture of one flat color (for a material that has a color but
+/// no texture), so the model shows its real colors instead of white.
+fn color_image(c: [f32; 4], cache: &Path) -> String {
+    let px = [to_srgb(c[0]), to_srgb(c[1]), to_srgb(c[2]), (c[3] * 255.0).round() as u8];
+    let p = cache.join(format!("color_{:02x}{:02x}{:02x}{:02x}.png", px[0], px[1], px[2], px[3]));
+    if !p.is_file() {
+        let _ = std::fs::create_dir_all(cache);
+        let _ = image::RgbaImage::from_pixel(4, 4, image::Rgba(px)).save(&p);
+    }
+    if p.is_file() { p.to_string_lossy().to_string() } else { String::new() }
+}
+
+/// A texture multiplied by its material color (made once, kept in the cache).
+fn tinted_image(file: &str, c: [f32; 4], cache: &Path) -> String {
+    let key = fnv(&format!("{file}|{:?}", c));
+    let p = cache.join(format!("tint_{key:016x}.png"));
+    if p.is_file() {
+        return p.to_string_lossy().to_string();
+    }
+    let Some(img) = crate::texture::open_image(file) else { return file.to_string() };
+    let mut img = img.to_rgba8();
+    let m = [to_srgb(c[0]) as u32, to_srgb(c[1]) as u32, to_srgb(c[2]) as u32, (c[3] * 255.0).round() as u32];
+    for px in img.pixels_mut() {
+        for k in 0..4 {
+            px.0[k] = (px.0[k] as u32 * m[k] / 255) as u8;
+        }
+    }
+    let _ = std::fs::create_dir_all(cache);
+    if img.save(&p).is_ok() { p.to_string_lossy().to_string() } else { file.to_string() }
+}
+
 pub fn cache_dir() -> PathBuf {
     crate::mount::content_dir().join("gltf_textures")
 }
@@ -213,8 +266,16 @@ pub fn load(path: &str) -> Result<TriMesh, String> {
     // materials -> texture slots
     let mats = g.json["materials"].as_array().cloned().unwrap_or_default();
     for mat in &mats {
-        let pbr = &mat["pbrMetallicRoughness"];
-        m.materials.push(g.image_file(pbr["baseColorTexture"]["index"].as_u64(), path, &cache));
+        let tex = g.image_file(base_texture(mat), path, &cache);
+        let color = base_color(mat);
+        let white = |c: [f32; 4]| c.iter().all(|x| *x > 0.98);
+        m.materials.push(match (tex.is_empty(), color) {
+            // no picture: show the material's color
+            (true, Some(c)) if !white(c) => color_image(c, &cache),
+            // a picture tinted by its color
+            (false, Some(c)) if !white(c) => tinted_image(&tex, c, &cache),
+            _ => tex,
+        });
         m.material_normals.push(g.image_file(mat["normalTexture"]["index"].as_u64(), path, &cache));
         m.material_alpha.push(match mat["alphaMode"].as_str() {
             Some("MASK") => 1,
